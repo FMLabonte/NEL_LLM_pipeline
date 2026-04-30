@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data outputs (generated CSVs, model outputs)
+output/
+results/
+
+# spaCy models (downloaded locally)
+en_core_web_sm*/
+en_core_sci_sm*/
+
+# Logs
+*.log
+
+# Environment variables / secrets
+.env
