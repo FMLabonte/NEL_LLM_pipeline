@@ -189,14 +189,26 @@ def evaluate_candidate_recall(
 # ── Quick demo ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import argparse
     import time
+
+    parser = argparse.ArgumentParser(description="Candidate Retriever Demo + Evaluation")
+    parser.add_argument(
+        "--backend", choices=["rapidfuzz", "elasticsearch"], default="rapidfuzz",
+        help="Search backend to use (default: rapidfuzz)",
+    )
+    parser.add_argument(
+        "--es-url", default="http://localhost:9200",
+        help="Elasticsearch URL (default: http://localhost:9200)",
+    )
+    args = parser.parse_args()
 
     # ── Step 1: Build the MeSH index ──
     print("=" * 60)
-    print("Building MeSH index...")
+    print(f"Building MeSH index (backend={args.backend})...")
     print("=" * 60)
 
-    index = MeSHIndex()
+    index = MeSHIndex(backend=args.backend, es_url=args.es_url)
     index.build_from_xml(
         descriptor_path=str(PROJECT_ROOT / "Data" / "MeSH" / "desc2026.xml"),
         supplementary_path=str(PROJECT_ROOT / "Data" / "MeSH" / "supp2026.xml"),
