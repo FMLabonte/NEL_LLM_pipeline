@@ -162,6 +162,7 @@ class MeSHIndex:
         self,
         descriptor_path: str | None = None,
         supplementary_path: str | None = None,
+        enrich_wikidata: bool = False,
     ):
         """
         Parse MeSH XML file(s) and build the search index.
@@ -172,11 +173,18 @@ class MeSHIndex:
             Path to desc2026.xml (main MeSH descriptors).
         supplementary_path : str or None
             Path to supp2026.xml (supplementary concepts, mostly chemicals).
+        enrich_wikidata : bool
+            If True, fetch additional synonyms from Wikidata before building
+            the search index. Cached after first run (~1-2 min).
         """
         if descriptor_path:
             self._parse_descriptors(descriptor_path)
         if supplementary_path:
             self._parse_supplementary(supplementary_path)
+
+        # Optionally enrich with Wikidata synonyms (adds extra labels)
+        if enrich_wikidata:
+            self._enrich_from_wikidata()
 
         # Build the appropriate search index based on backend
         if self.backend == "elasticsearch":
@@ -185,6 +193,33 @@ class MeSHIndex:
             self._build_label_index()
 
         print(f"MeSH index built ({self.backend}): {self.size} entities")
+
+    def _enrich_from_wikidata(self):
+        """
+        Add extra synonyms from Wikidata to existing MeSH entities.
+        Only adds synonyms for entities already in our index.
+        """
+        from wikidata_enricher import WikidataEnricher
+
+        enricher = WikidataEnricher()
+        wikidata_synonyms = enricher.fetch_mesh_synonyms()
+
+        added_count = 0
+        matched_entities = 0
+
+        for mesh_id, extra_syns in wikidata_synonyms.items():
+            if mesh_id in self.entities:
+                entity = self.entities[mesh_id]
+                # Only add synonyms we don't already have (case-insensitive check)
+                existing_lower = {s.lower() for s in entity.synonyms}
+                new_syns = [s for s in extra_syns if s.lower() not in existing_lower]
+                if new_syns:
+                    entity.synonyms.extend(new_syns)
+                    added_count += len(new_syns)
+                    matched_entities += 1
+
+        print(f"  Wikidata enrichment: added {added_count} new synonyms "
+              f"to {matched_entities} entities")
 
     def _parse_descriptors(self, path: str):
         """Parse MeSH descriptor XML (desc2026.xml)."""
@@ -601,6 +636,10 @@ if __name__ == "__main__":
         "--es-url", default="http://localhost:9200",
         help="Elasticsearch URL (default: http://localhost:9200)",
     )
+    parser.add_argument(
+        "--wikidata", action="store_true",
+        help="Enrich MeSH entities with Wikidata synonyms",
+    )
     args = parser.parse_args()
 
     print(f"Using backend: {args.backend}")
@@ -611,6 +650,7 @@ if __name__ == "__main__":
     index.build_from_xml(
         descriptor_path="../../Data/MeSH/desc2026.xml",
         supplementary_path="../../Data/MeSH/supp2026.xml",
+        enrich_wikidata=args.wikidata,
     )
     print(f"Index built in {time.time() - t0:.1f}s\n")
 

@@ -201,17 +201,22 @@ if __name__ == "__main__":
         "--es-url", default="http://localhost:9200",
         help="Elasticsearch URL (default: http://localhost:9200)",
     )
+    parser.add_argument(
+        "--wikidata", action="store_true",
+        help="Enrich MeSH entities with Wikidata synonyms",
+    )
     args = parser.parse_args()
 
     # ── Step 1: Build the MeSH index ──
     print("=" * 60)
-    print(f"Building MeSH index (backend={args.backend})...")
+    print(f"Building MeSH index (backend={args.backend}, wikidata={args.wikidata})...")
     print("=" * 60)
 
     index = MeSHIndex(backend=args.backend, es_url=args.es_url)
     index.build_from_xml(
         descriptor_path=str(PROJECT_ROOT / "Data" / "MeSH" / "desc2026.xml"),
         supplementary_path=str(PROJECT_ROOT / "Data" / "MeSH" / "supp2026.xml"),
+        enrich_wikidata=args.wikidata,
     )
 
     retriever = CandidateRetriever(index, top_k=10)
