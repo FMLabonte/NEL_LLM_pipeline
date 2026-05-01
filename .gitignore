@@ -28,6 +28,9 @@ Thumbs.db
 output/
 results/
 
+# MeSH data (too large for git, download separately)
+Data/MeSH/
+
 # spaCy models (downloaded locally)
 en_core_web_sm*/
 en_core_sci_sm*/

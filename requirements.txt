@@ -5,8 +5,9 @@ spacy>=3.7,<4.0
 pandas>=2.0
 numpy>=1.24
 
-# Search engine (Phase 2)
-# elasticsearch>=8.0
+# Candidate generation (Phase 2)
+rapidfuzz>=3.0              # fast fuzzy string matching for in-memory search
+# elasticsearch>=8.0        # uncomment when switching to ES backend
 
 # Testing
 pytest>=7.0
