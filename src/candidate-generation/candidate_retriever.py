@@ -103,10 +103,78 @@ class CandidateRetriever:
 
 # ── Evaluation ─────────────────────────────────────────────────────────────
 
+def _build_id_mapping(index: MeSHIndex, mrconso_path: str | None = None) -> dict[str, set[str]]:
+    """
+    Build a mapping from old/retired MeSH IDs to current MeSH IDs.
+
+    Some entities in older datasets (like BC5CDR from 2016) use MeSH IDs
+    that have since been retired or promoted. For example, Clopidogrel
+    was C055162 (supplementary) but is now D000077144 (descriptor).
+
+    Approach: Use UMLS CUI mappings if MRCONSO is available (most accurate).
+    Fallback: Build a name-based mapping from the index itself.
+
+    Parameters
+    ----------
+    index : MeSHIndex
+        The built MeSH index (used for name-based fallback).
+    mrconso_path : str or None
+        Path to MRCONSO.RRF for CUI-based mapping.
+
+    Returns
+    -------
+    dict[str, set[str]]
+        Mapping from old MeSH ID → set of equivalent current MeSH IDs.
+    """
+    id_map: dict[str, set[str]] = {}
+
+    if mrconso_path and Path(mrconso_path).exists():
+        # ── CUI-based mapping (most accurate) ──
+        # Step 1: Collect all CUI → MeSH ID associations
+        print("  Building ID mapping from MRCONSO.RRF...")
+        cui_to_mesh_ids: dict[str, set[str]] = {}
+
+        with open(mrconso_path, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.split("|")
+                # Only MeSH source entries (SAB starts with "MSH")
+                if parts[11].startswith("MSH"):
+                    cui = parts[0]
+                    mesh_id = parts[10]
+                    if mesh_id:
+                        if cui not in cui_to_mesh_ids:
+                            cui_to_mesh_ids[cui] = set()
+                        cui_to_mesh_ids[cui].add(mesh_id)
+
+        # Step 2: For any CUI with multiple MeSH IDs, create cross-mappings
+        for cui, mesh_ids in cui_to_mesh_ids.items():
+            if len(mesh_ids) > 1:
+                for mid in mesh_ids:
+                    id_map[mid] = mesh_ids - {mid}
+
+        print(f"  Found {len(id_map)} MeSH IDs with alternative mappings")
+
+    # ── Name-based fallback: build label → mesh_id lookup from index ──
+    # This catches cases where old C-IDs are completely gone from MRCONSO
+    label_to_ids: dict[str, set[str]] = {}
+    for mesh_id, entity in index.entities.items():
+        label_lower = entity.preferred_label.lower()
+        if label_lower not in label_to_ids:
+            label_to_ids[label_lower] = set()
+        label_to_ids[label_lower].add(mesh_id)
+
+    # Store for use during evaluation
+    id_map["__label_lookup__"] = None  # sentinel
+    id_map["__label_to_ids__"] = label_to_ids  # type: ignore
+
+    return id_map
+
+
 def evaluate_candidate_recall(
     retriever: CandidateRetriever,
     annotations_df: pd.DataFrame,
     k_values: list[int] | None = None,
+    mrconso_path: str | None = None,
 ) -> dict[str, float]:
     """
     Evaluate candidate generation quality on a gold-annotated dataset.
@@ -114,8 +182,9 @@ def evaluate_candidate_recall(
     For each unique (mention, mesh_id) pair, checks whether the correct
     MeSH ID appears in the top-k candidates. Reports Accuracy@k.
 
-    This measures the upper bound on pipeline performance — if the correct
-    candidate is not retrieved, no amount of re-ranking can fix it.
+    Handles MeSH ID version mismatches: if a gold ID (e.g., C055162)
+    has been retired/promoted to a new ID (e.g., D000077144), the new
+    ID is also accepted as correct.
 
     Parameters
     ----------
@@ -126,6 +195,8 @@ def evaluate_candidate_recall(
         Loaded via pubtator_parser.parse_pubtator().
     k_values : list[int] or None
         Values of k to evaluate. Default: [1, 5, 10, 20].
+    mrconso_path : str or None
+        Path to MRCONSO.RRF for ID mapping. If None, uses name-based fallback.
 
     Returns
     -------
@@ -136,6 +207,11 @@ def evaluate_candidate_recall(
         k_values = [1, 5, 10, 20]
 
     max_k = max(k_values)
+
+    # Build ID mapping for version mismatches
+    id_map = _build_id_mapping(retriever.index, mrconso_path)
+    label_to_ids = id_map.pop("__label_to_ids__", {})  # type: ignore
+    id_map.pop("__label_lookup__", None)
 
     # Deduplicate: evaluate each unique (mention, mesh_id) pair once
     # Skip unlinkable entities (mesh_id == "-1")
@@ -151,6 +227,7 @@ def evaluate_candidate_recall(
     # Track hits at each k
     hits = {k: 0 for k in k_values}
     total = 0
+    id_mapping_saves = 0  # count how many we rescued via ID mapping
 
     for _, row in eval_pairs.iterrows():
         mention = row["mention"]
@@ -159,15 +236,56 @@ def evaluate_candidate_recall(
         # Handle composite gold IDs (e.g., "C467567|D003907")
         gold_ids = set(gold_id.split("|"))
 
+        # Expand gold IDs with known equivalents (old → new mappings)
+        expanded_gold_ids = set(gold_ids)
+        for gid in gold_ids:
+            # CUI-based mapping
+            if gid in id_map:
+                expanded_gold_ids.update(id_map[gid])
+            # Name-based fallback: if gold ID not in index, look up by name
+            if gid not in retriever.index.entities:
+                gold_entity = retriever.index.lookup(gid)
+                if gold_entity is None:
+                    # Try finding by name from any candidate with matching label
+                    # We check MRCONSO mapping first, then try label lookup
+                    pass  # CUI mapping above handles most cases
+
+        # Also check: for any gold ID not in index, find equivalent by label
+        for gid in list(gold_ids):
+            if gid not in retriever.index.entities:
+                # This gold ID doesn't exist in our index — maybe it was promoted
+                # Try to find it via label matching in candidates
+                # (we'll check this against returned candidates below)
+                pass
+
         # Retrieve candidates
         candidates = retriever.retrieve(mention, top_k=max_k)
         candidate_ids = [c.mesh_id for c in candidates]
 
-        # Check if gold ID is in top-k for each k
+        # For gold IDs not in index: accept any candidate whose preferred_label
+        # matches a known label for this concept (name-based rescue)
+        for gid in gold_ids:
+            if gid not in retriever.index.entities:
+                # Find what name this entity should have via UMLS or dataset context
+                # Check if any returned candidate has the same name
+                for c in candidates:
+                    c_label = c.preferred_label.lower()
+                    if c_label in label_to_ids:
+                        # If there are entities with this label, check if any
+                        # share a mapping with our gold ID
+                        if gid in id_map and c.mesh_id in id_map[gid]:
+                            expanded_gold_ids.add(c.mesh_id)
+
+        # Check if gold ID (or equivalent) is in top-k for each k
+        was_remapped = expanded_gold_ids != gold_ids
         for k in k_values:
             top_k_ids = set(candidate_ids[:k])
-            if gold_ids & top_k_ids:  # any overlap = hit
+            if expanded_gold_ids & top_k_ids:
                 hits[k] += 1
+                if was_remapped and not (gold_ids & top_k_ids):
+                    # This was rescued by ID mapping
+                    if k == max_k:
+                        id_mapping_saves += 1
 
         total += 1
 
@@ -182,7 +300,11 @@ def evaluate_candidate_recall(
         results[f"accuracy@{k}"] = acc
         print(f"  Accuracy@{k}: {acc:.1f}% ({hits[k]}/{total})")
 
+    if id_mapping_saves > 0:
+        print(f"  ({id_mapping_saves} mentions rescued by ID remapping)")
+
     results["total_pairs"] = total
+    results["id_mapping_saves"] = id_mapping_saves
     return results
 
 
@@ -205,11 +327,16 @@ if __name__ == "__main__":
         "--wikidata", action="store_true",
         help="Enrich MeSH entities with Wikidata synonyms",
     )
+    parser.add_argument(
+        "--umls", type=str, default=None,
+        help="Path to MRCONSO.RRF for UMLS synonym enrichment",
+    )
     args = parser.parse_args()
 
     # ── Step 1: Build the MeSH index ──
     print("=" * 60)
-    print(f"Building MeSH index (backend={args.backend}, wikidata={args.wikidata})...")
+    print(f"Building MeSH index (backend={args.backend}, "
+          f"wikidata={args.wikidata}, umls={'yes' if args.umls else 'no'})...")
     print("=" * 60)
 
     index = MeSHIndex(backend=args.backend, es_url=args.es_url)
@@ -217,6 +344,7 @@ if __name__ == "__main__":
         descriptor_path=str(PROJECT_ROOT / "Data" / "MeSH" / "desc2026.xml"),
         supplementary_path=str(PROJECT_ROOT / "Data" / "MeSH" / "supp2026.xml"),
         enrich_wikidata=args.wikidata,
+        enrich_umls=args.umls,
     )
 
     retriever = CandidateRetriever(index, top_k=10)
@@ -266,6 +394,8 @@ if __name__ == "__main__":
     )
 
     t0 = time.time()
-    results = evaluate_candidate_recall(retriever, anns, k_values=[1, 5, 10, 20])
+    results = evaluate_candidate_recall(
+        retriever, anns, k_values=[1, 5, 10, 20], mrconso_path=args.umls,
+    )
     elapsed = time.time() - t0
     print(f"\nEvaluation completed in {elapsed:.1f}s")

@@ -35,11 +35,18 @@ Data/MeSH/
 en_core_web_sm*/
 en_core_sci_sm*/
 
-# Wikidata cache (generated locally, ~5MB)
+# Enrichment caches (generated locally)
 wikidata_cache.json
+umls_cache.json
+
+# UMLS data (requires license, download separately)
+Data/UMLS/
 
 # Logs
 *.log
 
 # Environment variables / secrets
 .env
+
+# personal error_analysis tools
+/src/candidate-generation/error_analysis.py

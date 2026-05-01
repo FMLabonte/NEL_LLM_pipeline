@@ -163,6 +163,7 @@ class MeSHIndex:
         descriptor_path: str | None = None,
         supplementary_path: str | None = None,
         enrich_wikidata: bool = False,
+        enrich_umls: str | None = None,
     ):
         """
         Parse MeSH XML file(s) and build the search index.
@@ -176,13 +177,18 @@ class MeSHIndex:
         enrich_wikidata : bool
             If True, fetch additional synonyms from Wikidata before building
             the search index. Cached after first run (~1-2 min).
+        enrich_umls : str or None
+            Path to MRCONSO.RRF file. If provided, enriches entities with
+            synonyms from all UMLS vocabularies. Cached after first run.
         """
         if descriptor_path:
             self._parse_descriptors(descriptor_path)
         if supplementary_path:
             self._parse_supplementary(supplementary_path)
 
-        # Optionally enrich with Wikidata synonyms (adds extra labels)
+        # Optionally enrich with additional synonym sources
+        if enrich_umls:
+            self._enrich_from_umls(enrich_umls)
         if enrich_wikidata:
             self._enrich_from_wikidata()
 
@@ -219,6 +225,33 @@ class MeSHIndex:
                     matched_entities += 1
 
         print(f"  Wikidata enrichment: added {added_count} new synonyms "
+              f"to {matched_entities} entities")
+
+    def _enrich_from_umls(self, mrconso_path: str):
+        """
+        Add extra synonyms from UMLS to existing MeSH entities.
+        Uses CUI mappings to find synonyms from DrugBank, SNOMED, RxNorm, etc.
+        """
+        from umls_enricher import UMLSEnricher
+
+        enricher = UMLSEnricher(mrconso_path)
+        umls_synonyms = enricher.get_mesh_synonyms()
+
+        added_count = 0
+        matched_entities = 0
+
+        for mesh_id, extra_syns in umls_synonyms.items():
+            if mesh_id in self.entities:
+                entity = self.entities[mesh_id]
+                # Only add synonyms we don't already have (case-insensitive check)
+                existing_lower = {s.lower() for s in entity.synonyms}
+                new_syns = [s for s in extra_syns if s.lower() not in existing_lower]
+                if new_syns:
+                    entity.synonyms.extend(new_syns)
+                    added_count += len(new_syns)
+                    matched_entities += 1
+
+        print(f"  UMLS enrichment: added {added_count} new synonyms "
               f"to {matched_entities} entities")
 
     def _parse_descriptors(self, path: str):
@@ -640,6 +673,10 @@ if __name__ == "__main__":
         "--wikidata", action="store_true",
         help="Enrich MeSH entities with Wikidata synonyms",
     )
+    parser.add_argument(
+        "--umls", type=str, default=None,
+        help="Path to MRCONSO.RRF for UMLS synonym enrichment",
+    )
     args = parser.parse_args()
 
     print(f"Using backend: {args.backend}")
@@ -651,6 +688,7 @@ if __name__ == "__main__":
         descriptor_path="../../Data/MeSH/desc2026.xml",
         supplementary_path="../../Data/MeSH/supp2026.xml",
         enrich_wikidata=args.wikidata,
+        enrich_umls=args.umls,
     )
     print(f"Index built in {time.time() - t0:.1f}s\n")
 
