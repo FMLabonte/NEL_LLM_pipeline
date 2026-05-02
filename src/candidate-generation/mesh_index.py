@@ -5,9 +5,7 @@ Builds and manages a search index over MeSH entities.
 
 Supports two search backends:
   - "rapidfuzz" (default): In-memory fuzzy string matching. No setup needed.
-  - "elasticsearch": BM25-based search via a local Elasticsearch instance.
-    Better for multi-word queries and term weighting. Requires ES running
-    on localhost:9200 (e.g., via Docker).
+  - "elasticsearch": BM25-based search via a local Elasticsearch instance (e.g., via Docker).
 
 Parses the MeSH descriptor XML (desc2026.xml) and supplementary
 concepts XML (supp2026.xml) into a searchable index. For each entity,
@@ -163,6 +161,7 @@ class MeSHIndex:
         descriptor_path: str | None = None,
         supplementary_path: str | None = None,
         enrich_wikidata: bool = False,
+        enrich_dbpedia: bool = False,
         enrich_umls: str | None = None,
     ):
         """
@@ -177,6 +176,9 @@ class MeSHIndex:
         enrich_wikidata : bool
             If True, fetch additional synonyms from Wikidata before building
             the search index. Cached after first run (~1-2 min).
+        enrich_dbpedia : bool
+            If True, fetch additional labels and Wikipedia redirects from
+            DBpedia. Cached after first run (~1-2 min).
         enrich_umls : str or None
             Path to MRCONSO.RRF file. If provided, enriches entities with
             synonyms from all UMLS vocabularies. Cached after first run.
@@ -191,6 +193,8 @@ class MeSHIndex:
             self._enrich_from_umls(enrich_umls)
         if enrich_wikidata:
             self._enrich_from_wikidata()
+        if enrich_dbpedia:
+            self._enrich_from_dbpedia()
 
         # Build the appropriate search index based on backend
         if self.backend == "elasticsearch":
@@ -225,6 +229,32 @@ class MeSHIndex:
                     matched_entities += 1
 
         print(f"  Wikidata enrichment: added {added_count} new synonyms "
+              f"to {matched_entities} entities")
+
+    def _enrich_from_dbpedia(self):
+        """
+        Add extra synonyms from DBpedia to existing MeSH entities.
+        Includes Wikipedia redirect titles (informal/alternative names).
+        """
+        from dbpedia_enricher import DBpediaEnricher
+
+        enricher = DBpediaEnricher()
+        dbpedia_synonyms = enricher.fetch_mesh_synonyms()
+
+        added_count = 0
+        matched_entities = 0
+
+        for mesh_id, extra_syns in dbpedia_synonyms.items():
+            if mesh_id in self.entities:
+                entity = self.entities[mesh_id]
+                existing_lower = {s.lower() for s in entity.synonyms}
+                new_syns = [s for s in extra_syns if s.lower() not in existing_lower]
+                if new_syns:
+                    entity.synonyms.extend(new_syns)
+                    added_count += len(new_syns)
+                    matched_entities += 1
+
+        print(f"  DBpedia enrichment: added {added_count} new synonyms "
               f"to {matched_entities} entities")
 
     def _enrich_from_umls(self, mrconso_path: str):
@@ -674,6 +704,10 @@ if __name__ == "__main__":
         help="Enrich MeSH entities with Wikidata synonyms",
     )
     parser.add_argument(
+        "--dbpedia", action="store_true",
+        help="Enrich MeSH entities with DBpedia labels and Wikipedia redirects",
+    )
+    parser.add_argument(
         "--umls", type=str, default=None,
         help="Path to MRCONSO.RRF for UMLS synonym enrichment",
     )
@@ -688,6 +722,7 @@ if __name__ == "__main__":
         descriptor_path="../../Data/MeSH/desc2026.xml",
         supplementary_path="../../Data/MeSH/supp2026.xml",
         enrich_wikidata=args.wikidata,
+        enrich_dbpedia=args.dbpedia,
         enrich_umls=args.umls,
     )
     print(f"Index built in {time.time() - t0:.1f}s\n")

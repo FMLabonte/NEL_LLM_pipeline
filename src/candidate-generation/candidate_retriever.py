@@ -328,6 +328,10 @@ if __name__ == "__main__":
         help="Enrich MeSH entities with Wikidata synonyms",
     )
     parser.add_argument(
+        "--dbpedia", action="store_true",
+        help="Enrich MeSH entities with DBpedia labels and Wikipedia redirects",
+    )
+    parser.add_argument(
         "--umls", type=str, default=None,
         help="Path to MRCONSO.RRF for UMLS synonym enrichment",
     )
@@ -336,7 +340,8 @@ if __name__ == "__main__":
     # ── Step 1: Build the MeSH index ──
     print("=" * 60)
     print(f"Building MeSH index (backend={args.backend}, "
-          f"wikidata={args.wikidata}, umls={'yes' if args.umls else 'no'})...")
+          f"wikidata={args.wikidata}, dbpedia={args.dbpedia}, "
+          f"umls={'yes' if args.umls else 'no'})...")
     print("=" * 60)
 
     index = MeSHIndex(backend=args.backend, es_url=args.es_url)
@@ -344,6 +349,7 @@ if __name__ == "__main__":
         descriptor_path=str(PROJECT_ROOT / "Data" / "MeSH" / "desc2026.xml"),
         supplementary_path=str(PROJECT_ROOT / "Data" / "MeSH" / "supp2026.xml"),
         enrich_wikidata=args.wikidata,
+        enrich_dbpedia=args.dbpedia,
         enrich_umls=args.umls,
     )
 
