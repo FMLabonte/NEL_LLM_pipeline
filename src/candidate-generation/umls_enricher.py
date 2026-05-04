@@ -26,8 +26,8 @@ import json
 from pathlib import Path
 
 
-# Cache file to avoid re-parsing the 17M line file every time
-DEFAULT_CACHE_PATH = Path(__file__).parent / "umls_cache.json"
+# Cache file to avoid reparsing the 17M line file every time
+DEFAULT_CACHE_PATH = Path(__file__).parent / "cache" / "umls_cache.json"
 
 
 # ── MRCONSO.RRF column indices (pipe-delimited) ──────────────────────────

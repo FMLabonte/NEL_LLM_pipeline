@@ -33,7 +33,7 @@ from pathlib import Path
 DBPEDIA_SPARQL_URL = "https://dbpedia.org/sparql"
 
 # Cache file to avoid re-querying DBpedia every time
-DEFAULT_CACHE_PATH = Path(__file__).parent / "dbpedia_cache.json"
+DEFAULT_CACHE_PATH = Path(__file__).parent / "cache" / "dbpedia_cache.json"
 
 
 class DBpediaEnricher:

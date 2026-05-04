@@ -32,7 +32,7 @@ from pathlib import Path
 WIKIDATA_SPARQL_URL = "https://query.wikidata.org/sparql"
 
 # Cache file to avoid re-querying Wikidata every time
-DEFAULT_CACHE_PATH = Path(__file__).parent / "wikidata_cache.json"
+DEFAULT_CACHE_PATH = Path(__file__).parent / "cache" / "wikidata_cache.json"
 
 
 class WikidataEnricher:

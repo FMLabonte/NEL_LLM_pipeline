@@ -35,10 +35,8 @@ Data/MeSH/
 en_core_web_sm*/
 en_core_sci_sm*/
 
-# Enrichment caches (generated locally)
-wikidata_cache.json
-dbpedia_cache.json
-umls_cache.json
+# Enrichment caches (generated locally, kept in src/candidate-generation/cache/)
+src/candidate-generation/cache/*.json
 
 # UMLS data (requires license, download separately)
 Data/UMLS/
