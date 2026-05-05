@@ -9,6 +9,9 @@ numpy>=1.24
 rapidfuzz>=3.0              # fast fuzzy string matching for in-memory search
 elasticsearch>=8.0,<9.0      # Elasticsearch backend (must match ES server version)
 
+# LLM Disambiguation (Phase 4)
+openai>=1.0                 # OpenAI-compatible API client (works with LMStudio)
+
 # Testing
 pytest>=7.0
 
