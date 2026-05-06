@@ -22,6 +22,10 @@ UMLS: https://www.nlm.nih.gov/research/umls/index.html
 - Does this task scale with model size ? 
 - How does the tool set translate between different Taxonomies ( test if it also works on the UMLS taxonomy and other datasets then BioRED) ?
 
+## Documentation
+
+Weekly meeting notes: https://docs.google.com/document/d/1_DmrtqQWpdnQQE_71h7lYk4wgu98fmlX8stkaHvZ08M/edit?usp=sharing
+
 ## Example of Data Loading
 Example usage of the custom data loader this allows you to load all 3 datasets that we are interested in uniformely. Making it easier to work with down the line
 ```python
