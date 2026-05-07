@@ -69,6 +69,47 @@ Your job: Select the candidate that best matches the mention IN CONTEXT. Conside
 IMPORTANT: Respond with ONLY the number of your chosen candidate (e.g., "1" or "3"). Nothing else. If none of the candidates match, respond with "NONE".
 """
 
+def _extract_mention_window(context: str, mention: str, n_sentences: int = 2) -> str:
+    """
+    Extract the sentence containing the mention plus n sentences before and after.
+    The mention is highlighted with **markers** in the output.
+    """
+    import re as _re
+
+    # Split context into sentences (handles ". ", "? ", "! " and end-of-string)
+    sentences = _re.split(r'(?<=[.!?])\s+', context.strip())
+    if not sentences:
+        return context
+
+    # Find which sentence contains the mention (case-insensitive)
+    mention_lower = mention.lower()
+    mention_idx = None
+    for i, sent in enumerate(sentences):
+        if mention_lower in sent.lower():
+            mention_idx = i
+            break
+
+    if mention_idx is None:
+        # Mention isn't found in sentences, return full context with highlight
+        highlighted = context.replace(mention, f"**{mention}**", 1)
+        return highlighted
+
+    # Extract window: n sentences before + mention sentence + n sentences after
+    start = max(0, mention_idx - n_sentences)
+    end = min(len(sentences), mention_idx + n_sentences + 1)
+    window = sentences[start:end]
+
+    # Highlight the mention in the relevant sentence
+    window_text = " ".join(window)
+    # Case-preserving highlight
+    idx = window_text.lower().find(mention_lower)
+    if idx >= 0:
+        original = window_text[idx:idx + len(mention)]
+        window_text = window_text[:idx] + f"**{original}**" + window_text[idx + len(mention):]
+
+    return window_text
+
+
 def _build_user_prompt(
     mention: str,
     candidates: list,
@@ -86,18 +127,27 @@ def _build_user_prompt(
     parts.append(f"**Text:** {context}")
     parts.append("")
 
-    # Highlight the mention
+    # Extract mention with surrounding sentences (2 before + 2 after)
+    mention_window = _extract_mention_window(context, mention, n_sentences=2)
     parts.append(f'## Mention to Link: "{mention}"')
+    parts.append(f"**Context window:** {mention_window}")
     parts.append("")
-
-    # Todo: Append also the sentence and the 2 before and after that one
 
     # Build candidate list
     parts.append("## Candidates")
     for i, c in enumerate(candidates, 1):
         # Label
-        line = f"{i}. **{c.preferred_label}** [{c.mesh_id}]" # Todo: Check if this is enough. Can we add more?
+        line = f"{i}. **{c.preferred_label}** [{c.mesh_id}]"
         parts.append(line)
+
+        # Semantic category from MeSH tree numbers (e.g., "Diseases", "Chemicals and Drugs")
+        tree_numbers = getattr(c, "tree_numbers", [])
+        if tree_numbers:
+            _TREE_CATS = {"A": "Anatomy", "B": "Organisms", "C": "Diseases",
+                          "D": "Chemicals and Drugs", "E": "Techniques", "F": "Psychology",
+                          "G": "Phenomena", "N": "Health Care"}
+            cats = sorted({_TREE_CATS.get(tn[0], tn[0]) for tn in tree_numbers if tn})
+            parts.append(f"   Category: {', '.join(cats)}")
 
         # Definition (truncated)
         if c.definition:
@@ -172,15 +222,27 @@ class LLMDisambiguator:
             timeout=timeout,
         )
 
-        # Verify connection
+        # Verify connection and auto-detect model name
         try:
             models = self.client.models.list()
             model_ids = [m.id for m in models.data]
             print(f"Connected to LLM API at {base_url}")
             print(f"  Available models: {model_ids}")
             if model not in model_ids:
-                print(f"  Warning: model '{model}' not in list. " # Todo: Fix, because its qwen/qwen3-4b-2507 in lm studio
-                      f"LMStudio might use a different ID.")
+                # LMStudio often uses "org/model" format (e.g., "qwen/qwen3-4b-2507")
+                # Auto-detect: if exactly one model is loaded, use that
+                if len(model_ids) == 1:
+                    self.model = model_ids[0]
+                    print(f"  Auto-detected model: '{self.model}'")
+                else:
+                    # Try partial match (e.g., "qwen3-4b" matches "qwen/qwen3-4b-2507")
+                    matches = [m for m in model_ids if model in m or m in model]
+                    if len(matches) == 1:
+                        self.model = matches[0]
+                        print(f"  Auto-detected model: '{self.model}'")
+                    else:
+                        print(f"  Warning: model '{model}' not in list. Using first available.")
+                        self.model = model_ids[0] if model_ids else model
         except Exception as e:
             print(f"Warning: Could not connect to LLM API at {base_url}: {e}")
             print("Make sure LMStudio is running with the server enabled.")
