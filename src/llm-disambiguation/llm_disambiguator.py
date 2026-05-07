@@ -1,14 +1,11 @@
 """
 LLM Disambiguator
 ==================
-Phase 4 of the BioLinkerAI pipeline.
-
-Given a list of candidate entities (from Phase 2) and the document context,
-uses an LLM to select the best matching entity for a given mention.
+Given a list of candidate entities and the document context, a LLM tries to select the best matching candidate.
 
 The LLM receives:
-  - The paper context (title + abstract)
-  - The mention (surface form highlighted in its sentence)
+  - The paper context (title and abstract)
+  - The mention (surface form highlighted in its sentence. Additionally, 2 sentences before and after that)
   - A numbered list of candidate entities with labels, definitions, synonyms
   - An instruction to pick the best match
 
@@ -19,16 +16,15 @@ Usage:
 
     disambiguator = LLMDisambiguator(
         model="qwen3-4b-2507",
-        base_url="http://localhost:1234/v1",
-    )
+        base_url="http://localhost:1234/v1")
 
     result = disambiguator.disambiguate(
-        mention="seizures",
-        candidates=candidates,       # list[CandidateEntity] from Phase 2
-        context="Famotidine-induced seizures were observed...",
-        title="Adverse effects of famotidine",
-    )
-    # result.mesh_id -> "D012640"
+        mention="...",
+        candidates=[...],
+        context="...",
+        title="...")
+
+    # result.mesh_id -> "..."
 """
 
 import re
@@ -46,48 +42,32 @@ from openai import OpenAI
 class DisambiguationResult:
     """
     Result of LLM disambiguation for a single mention.
-
-    Attributes
-    ----------
-    mention : str
-        The original mention text.
-    mesh_id : str
-        The MeSH ID chosen by the LLM.
-    preferred_label : str
-        The preferred label of the chosen entity.
-    chosen_rank : int
-        The rank (1-based) of the chosen candidate in the original list.
-        -1 if the LLM chose NONE or parsing failed.
-    confidence : str
-        "llm" if the LLM made a valid choice, "fallback" if we fell back
-        to the top-1 candidate due to parse errors.
-    raw_response : str
-        The raw LLM response text (for debugging).
     """
-    mention: str
-    mesh_id: str
+    mention: str # original mention text
+    mesh_id: str # chosen by LLM
     preferred_label: str
-    chosen_rank: int
+    chosen_rank: int # -1 if LLM chose NONE
     confidence: str  # "llm" or "fallback"
-    raw_response: str
+    raw_response: str # for debugging purposes
 
 
 # ── Prompt templates ──────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are a biomedical entity linking expert. Your task is to link entity mentions in biomedical texts to the correct MeSH (Medical Subject Headings) identifier.
+SYSTEM_PROMPT = """
+You are a biomedical entity linking expert. Your task is to link entity mentions in biomedical texts to the correct MeSH (Medical Subject Headings) identifier.
 
 You will be given:
 1. A biomedical text (title and abstract of a paper)
-2. A highlighted mention (the entity to link)
-3. A numbered list of candidate MeSH entities
+2. A highlighted mention (the entity to link) inside the sentence, including 2 sentences before and after that mention
+3. A numbered list of candidate MeSH entities, which was already ranked using domain specific rules
 
 Your job: Select the candidate that best matches the mention IN CONTEXT. Consider:
 - The meaning of the mention in its specific context
 - Whether the candidate's definition fits the usage
 - Synonyms and alternative names
 
-IMPORTANT: Respond with ONLY the number of your chosen candidate (e.g., "1" or "3"). Nothing else. If none of the candidates match, respond with "NONE"."""
-
+IMPORTANT: Respond with ONLY the number of your chosen candidate (e.g., "1" or "3"). Nothing else. If none of the candidates match, respond with "NONE".
+"""
 
 def _build_user_prompt(
     mention: str,
@@ -97,24 +77,7 @@ def _build_user_prompt(
     max_definition_len: int = 150,
     max_synonyms: int = 3,
 ) -> str:
-    """
-    Build the user prompt for the LLM.
 
-    Parameters
-    ----------
-    mention : str
-        The entity mention to disambiguate.
-    candidates : list[CandidateEntity]
-        Ranked candidates from Phase 2.
-    context : str
-        The document text (abstract or sentence) containing the mention.
-    title : str
-        The paper title.
-    max_definition_len : int
-        Max characters for definition (truncated with "...").
-    max_synonyms : int
-        Max number of synonyms to show per candidate.
-    """
     # Build context section
     parts = []
     parts.append("## Biomedical Text")
@@ -127,11 +90,13 @@ def _build_user_prompt(
     parts.append(f'## Mention to Link: "{mention}"')
     parts.append("")
 
+    # Todo: Append also the sentence and the 2 before and after that one
+
     # Build candidate list
     parts.append("## Candidates")
     for i, c in enumerate(candidates, 1):
         # Label
-        line = f"{i}. **{c.preferred_label}** [{c.mesh_id}]"
+        line = f"{i}. **{c.preferred_label}** [{c.mesh_id}]" # Todo: Check if this is enough. Can we add more?
         parts.append(line)
 
         # Definition (truncated)
@@ -147,7 +112,7 @@ def _build_user_prompt(
             shown = other_syns[:max_synonyms]
             parts.append(f"   Synonyms: {', '.join(shown)}")
 
-        # Score from Phase 2
+        # Score from domain specific rules
         parts.append(f"   Match score: {c.score:.1f}")
         parts.append("")
 
@@ -157,29 +122,20 @@ def _build_user_prompt(
 
 
 def _parse_llm_response(response: str, num_candidates: int) -> int | None:
-    """
-    Parse the LLM response to extract the chosen candidate number.
-
-    Returns
-    -------
-    int or None
-        The 1-based candidate index, or None if parsing failed / NONE chosen.
-    """
     text = response.strip()
 
-    # Check for NONE
+    # Check for case NONE
     if text.upper() == "NONE":
         return None
 
-    # Try to extract a number — handle cases like "1", "1.", "Candidate 1",
-    # "The best match is 1", etc.
+    # Try to extract a number, handle cases like "1", "1.", "Candidate 1", "The best match is 1", etc.
     # First try: just a plain number
     if text.isdigit():
         num = int(text)
         if 1 <= num <= num_candidates:
             return num
 
-    # Second try: find first number in the response
+    # Second try: find the first number in the response
     match = re.search(r'\b(\d+)\b', text)
     if match:
         num = int(match.group(1))
@@ -196,19 +152,6 @@ class LLMDisambiguator:
     Uses an LLM to disambiguate between candidate entities.
 
     Connects to an OpenAI-compatible API (e.g., LMStudio).
-
-    Parameters
-    ----------
-    model : str
-        Model name as shown in LMStudio (e.g., "qwen3-4b-2507").
-    base_url : str
-        API base URL (e.g., "http://localhost:1234/v1").
-    temperature : float
-        Sampling temperature. 0 for deterministic output.
-    max_tokens : int
-        Max tokens in LLM response (should be small — we only need a number).
-    timeout : float
-        Request timeout in seconds.
     """
 
     def __init__(
@@ -236,7 +179,7 @@ class LLMDisambiguator:
             print(f"Connected to LLM API at {base_url}")
             print(f"  Available models: {model_ids}")
             if model not in model_ids:
-                print(f"  Warning: model '{model}' not in list. "
+                print(f"  Warning: model '{model}' not in list. " # Todo: Fix, because its qwen/qwen3-4b-2507 in lm studio
                       f"LMStudio might use a different ID.")
         except Exception as e:
             print(f"Warning: Could not connect to LLM API at {base_url}: {e}")
@@ -250,23 +193,7 @@ class LLMDisambiguator:
         title: str = "",
     ) -> DisambiguationResult:
         """
-        Disambiguate a mention using the LLM.
-
-        Parameters
-        ----------
-        mention : str
-            The entity mention text.
-        candidates : list[CandidateEntity]
-            Ranked candidates from Phase 2.
-        context : str
-            The document text containing the mention.
-        title : str
-            The paper title.
-
-        Returns
-        -------
-        DisambiguationResult
-            The LLM's choice with metadata.
+        This is the interface for the pipeline.
         """
         if not candidates:
             return DisambiguationResult(
@@ -278,7 +205,6 @@ class LLMDisambiguator:
                 raw_response="",
             )
 
-        # Build prompt
         user_prompt = _build_user_prompt(mention, candidates, context, title)
 
         # Call LLM
@@ -335,18 +261,7 @@ class LLMDisambiguator:
         top_k: int = 5,
     ) -> list[DisambiguationResult]:
         """
-        Disambiguate a batch of mentions.
-
-        Parameters
-        ----------
-        items : list[dict]
-            Each dict has keys: mention, candidates, context, title.
-        top_k : int
-            Only pass top_k candidates to the LLM (to keep prompts short).
-
-        Returns
-        -------
-        list[DisambiguationResult]
+       Uses the disambiguate() method for a batch of mentions.
         """
         results = []
         total = len(items)
@@ -367,45 +282,3 @@ class LLMDisambiguator:
                 print(f"  ... {i+1}/{total} mentions disambiguated", flush=True)
 
         return results
-
-
-# ── Quick demo ──────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="LLM Disambiguator Demo")
-    parser.add_argument("--model", default="qwen3-4b-2507", help="Model name in LMStudio")
-    parser.add_argument("--base-url", default="http://localhost:1234/v1", help="API base URL")
-    args = parser.parse_args()
-
-    disambiguator = LLMDisambiguator(model=args.model, base_url=args.base_url)
-
-    # Quick test with a fake candidate list
-    from dataclasses import dataclass as dc, field as f
-
-    @dc
-    class FakeCandidate:
-        mesh_id: str
-        preferred_label: str
-        synonyms: list = f(default_factory=list)
-        definition: str = ""
-        score: float = 0.0
-
-    candidates = [
-        FakeCandidate("D012640", "Seizures", ["Convulsions", "Epileptic seizure"], "A sudden onset of excessive activity in the brain.", 95.0),
-        FakeCandidate("D004827", "Epilepsy", ["Seizure disorder"], "A brain disorder involving repeated seizures.", 80.0),
-        FakeCandidate("D013575", "Syncope", ["Fainting"], "Transient loss of consciousness.", 60.0),
-    ]
-
-    result = disambiguator.disambiguate(
-        mention="seizures",
-        candidates=candidates,
-        context="The patient experienced recurrent seizures after administration of the drug.",
-        title="Adverse neurological effects of famotidine",
-    )
-
-    print(f"\nResult: [{result.mesh_id}] {result.preferred_label}")
-    print(f"  Chosen rank: {result.chosen_rank}")
-    print(f"  Confidence: {result.confidence}")
-    print(f"  Raw response: '{result.raw_response}'")
