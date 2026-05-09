@@ -1,11 +1,8 @@
 """
 Candidate Retriever
 ====================
-Phase 2 of the BioLinkerAI pipeline.
-
 Given an entity mention (surface form), retrieves a ranked list of
-candidate entities from the MeSH knowledge base. This implements the
-candidate generation process described in Section 3 of the paper:
+candidate entities from the MeSH knowledge base:
     1. Search the Background Knowledge via string similarity
     2. Enrich candidates with aliases
     3. Rank with BM25 / similarity scoring
@@ -15,7 +12,7 @@ Usage:
     from candidate_retriever import CandidateRetriever
 
     index = MeSHIndex()
-    index.build_from_xml("Data/MeSH/desc2026.xml", "Data/MeSH/supp2026.xml")
+    index.build_from_xml("Data/MeSH/desc2026.xml", "Data/MeSH/supp2026.xml") # TODO: Enrich this one?
 
     retriever = CandidateRetriever(index)
     candidates = retriever.retrieve("famotidine", top_k=10)
@@ -41,14 +38,6 @@ class CandidateRetriever:
     Retrieves and ranks candidate entities for a given mention.
 
     Wraps the MeSHIndex search and adds the full retrieval pipeline
-    as described in the BioLinkerAI paper (Phase 2).
-
-    Parameters
-    ----------
-    index : MeSHIndex
-        A built MeSH search index.
-    top_k : int
-        Default number of candidates to retrieve per mention.
     """
 
     def __init__(self, index: MeSHIndex, top_k: int = 10):
@@ -58,18 +47,6 @@ class CandidateRetriever:
     def retrieve(self, mention: str, top_k: int | None = None) -> list[CandidateEntity]:
         """
         Retrieve top-k candidate entities for a mention.
-
-        Parameters
-        ----------
-        mention : str
-            The entity surface form (e.g., "famotidine", "seizures").
-        top_k : int or None
-            Number of candidates to return. Uses default if None.
-
-        Returns
-        -------
-        list[CandidateEntity]
-            Ranked list of candidates (best match first).
         """
         k = top_k or self.top_k
         candidates = self.index.search(mention, top_k=k)
@@ -82,18 +59,6 @@ class CandidateRetriever:
     ) -> dict[str, list[CandidateEntity]]:
         """
         Retrieve candidates for a batch of mentions.
-
-        Parameters
-        ----------
-        mentions : list[str]
-            List of entity surface forms.
-        top_k : int or None
-            Number of candidates per mention.
-
-        Returns
-        -------
-        dict[str, list[CandidateEntity]]
-            Mapping from mention text to its candidate list.
         """
         return {
             mention: self.retrieve(mention, top_k)
@@ -113,18 +78,6 @@ def _build_id_mapping(index: MeSHIndex, mrconso_path: str | None = None) -> dict
 
     Approach: Use UMLS CUI mappings if MRCONSO is available (most accurate).
     Fallback: Build a name-based mapping from the index itself.
-
-    Parameters
-    ----------
-    index : MeSHIndex
-        The built MeSH index (used for name-based fallback).
-    mrconso_path : str or None
-        Path to MRCONSO.RRF for CUI-based mapping.
-
-    Returns
-    -------
-    dict[str, set[str]]
-        Mapping from old MeSH ID → set of equivalent current MeSH IDs.
     """
     id_map: dict[str, set[str]] = {}
 
@@ -185,23 +138,6 @@ def evaluate_candidate_recall(
     Handles MeSH ID version mismatches: if a gold ID (e.g., C055162)
     has been retired/promoted to a new ID (e.g., D000077144), the new
     ID is also accepted as correct.
-
-    Parameters
-    ----------
-    retriever : CandidateRetriever
-        The retriever to evaluate.
-    annotations_df : pd.DataFrame
-        Gold annotations with columns: mention, mesh_id, entity_type.
-        Loaded via pubtator_parser.parse_pubtator().
-    k_values : list[int] or None
-        Values of k to evaluate. Default: [1, 5, 10, 20].
-    mrconso_path : str or None
-        Path to MRCONSO.RRF for ID mapping. If None, uses name-based fallback.
-
-    Returns
-    -------
-    dict[str, float]
-        Results dict with keys like "accuracy@1", "accuracy@5", etc.
     """
     if k_values is None:
         k_values = [1, 5, 10, 20]

@@ -44,6 +44,8 @@ sys.path.insert(0, str(PROJECT_ROOT / "src" / "linguistic-rules"))
 
 from mesh_index import MeSHIndex
 from candidate_retriever import CandidateRetriever
+from candidate_expander import CandidateExpander
+from umls_relation_expander import UMLSRelationExpander
 from domain_rules import DomainRuleReranker
 from llm_disambiguator import LLMDisambiguator
 
@@ -112,10 +114,14 @@ class BioLinkerPipeline:
         Whether to enrich with DBpedia synonyms.
     enrich_umls : str or None
         Path to MRCONSO.RRF for UMLS enrichment (None = skip).
+    use_expansion : bool
+        Whether to apply candidate expansion (UMLS bridge, multi-word, parent injection).
     use_phase3 : bool
         Whether to apply Phase 3 domain rules (default: True).
     use_phase4 : bool
         Whether to apply Phase 4 LLM disambiguation (default: True).
+    mrrel_path : str or None
+        Path to MRREL.RRF for UMLS relation bridge (None = skip).
     llm_model : str
         LLM model name for Phase 4.
     llm_base_url : str
@@ -140,17 +146,20 @@ class BioLinkerPipeline:
         enrich_wikidata: bool = False,
         enrich_dbpedia: bool = False,
         enrich_umls: str | None = None,
+        use_expansion: bool = True,
         use_phase3: bool = True,
         use_phase4: bool = True,
+        mrrel_path: str | None = None,
         llm_model: str = "qwen3-4b-2507",
         llm_base_url: str = "http://localhost:1234/v1",
-        llm_top_k: int = 5,
+        llm_top_k: int = 10,
         rule5_boost: float = 2.0,
         rule6_penalty: float = -30.0,
         rule7_boost: float = 3.0,
     ):
         self.top_k = top_k
         self.llm_top_k = llm_top_k
+        self.use_expansion = use_expansion
         self.use_phase3 = use_phase3
         self.use_phase4 = use_phase4
 
@@ -170,6 +179,19 @@ class BioLinkerPipeline:
                 enrich_umls=enrich_umls,
             )
         self.retriever = CandidateRetriever(self.index, top_k=top_k)
+
+        # ── Phase 2b: Candidate Expansion (UMLS bridge + multi-word + parent) ──
+        self.expander = None
+        if use_expansion:
+            umls_bridge = None
+            mrconso = enrich_umls or str(PROJECT_ROOT / "Data" / "UMLS" / "MRCONSO.RRF")
+            mrrel = mrrel_path or str(PROJECT_ROOT / "Data" / "UMLS" / "MRREL.RRF")
+            if Path(mrrel).exists() and Path(mrconso).exists():
+                umls_bridge = UMLSRelationExpander(mrconso, mrrel)
+                umls_bridge.build_bridge()
+            self.expander = CandidateExpander(
+                self.index, self.retriever, umls_bridge=umls_bridge,
+            )
 
         # ── Phase 3: Domain Rule Reranker ──
         wikidata, dbpedia, umls = self._load_enrichment_caches()
@@ -367,6 +389,16 @@ class BioLinkerPipeline:
             )
 
         phase2_top1 = candidates[0].mesh_id
+
+        # ── Phase 2b: Candidate Expansion (UMLS bridge + multi-word + parent) ──
+        if self.use_expansion and self.expander is not None:
+            exp_top_k = max(self.top_k + 10, len(candidates) + 10)
+            candidates = self.expander.expand(
+                mention=mention,
+                candidates=candidates,
+                entity_type=entity_type,
+                top_k=exp_top_k,
+            )
 
         # ── Phase 3: Domain-Specific Rules (Re-Ranking) ──
         if self.use_phase3:

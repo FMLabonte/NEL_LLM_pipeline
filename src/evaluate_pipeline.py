@@ -1,18 +1,22 @@
 """
 Pipeline Evaluation: Full BioLinkerAI on BC5CDR
 ================================================
-End-to-end evaluation that runs Phase 2 → Phase 3 → Phase 4
+End-to-end evaluation that runs Phase 2 → (2b) → Phase 3 → Phase 4
 on the BC5CDR test set with gold entities, showing the
 contribution of each phase.
 
 Reports:
   - Phase 2 only (candidate generation) Accuracy@1
-  - Phase 2 + 3 (with domain rules) Accuracy@1
-  - Phase 2 + 3 + 4 (with LLM) Accuracy@1
+  - Phase 2 + 2b (with candidate expansion) Accuracy@1
+  - Phase 2 + 2b + 3 (with domain rules) Accuracy@1
+  - Phase 2 + 2b + 3 + 4 (with LLM) Accuracy@1
   - Per-phase improvement / degradation counts
 
 Usage:
-    # Phase 2 + 3 only (no LLM):
+    # Phase 2 + 3 only (no LLM, no expansion):
+    python3 evaluate_pipeline.py --no-phase4 --no-expansion
+
+    # Phase 2 + 2b + 3 (with expansion, no LLM):
     python3 evaluate_pipeline.py --no-phase4
 
     # Full pipeline with LLM:
@@ -41,6 +45,8 @@ sys.path.insert(0, str(PROJECT_ROOT / "src" / "llm-disambiguation"))
 from pubtator_parser import parse_pubtator
 from mesh_index import MeSHIndex
 from candidate_retriever import CandidateRetriever, _build_id_mapping
+from candidate_expander import CandidateExpander
+from umls_relation_expander import UMLSRelationExpander
 from domain_rules import DomainRuleReranker
 from llm_disambiguator import LLMDisambiguator
 
@@ -88,6 +94,26 @@ def run_evaluation(args):
     )
 
     retriever = CandidateRetriever(index, top_k=args.top_k)
+
+    # ── Step 1b: Build Candidate Expander (optional) ──
+    expander = None
+    if not args.no_expansion:
+        umls_bridge = None
+        mrconso = args.umls or str(PROJECT_ROOT / "Data" / "UMLS" / "MRCONSO.RRF")
+        mrrel = args.mrrel or str(PROJECT_ROOT / "Data" / "UMLS" / "MRREL.RRF")
+        if Path(mrrel).exists() and Path(mrconso).exists():
+            umls_bridge = UMLSRelationExpander(mrconso, mrrel)
+            umls_bridge.build_bridge()
+            print(f"  UMLS bridge loaded: {len(umls_bridge.bridge)} entries")
+        else:
+            print("  UMLS bridge: MRREL/MRCONSO not found, skipping UMLS bridge expansion")
+
+        expander = CandidateExpander(
+            index, retriever, umls_bridge=umls_bridge,
+        )
+        print("  Candidate expander initialized (UMLS bridge + multi-word + parent injection)")
+    else:
+        print("  Candidate expansion: DISABLED")
 
     # ── Step 2: Load enrichment caches for Phase 3 ──
     cache_dir = PROJECT_ROOT / "src" / "candidate-generation" / "cache"
@@ -169,21 +195,40 @@ def run_evaluation(args):
 
     # ── Step 6: Run evaluation ──
     print("\n" + "=" * 60)
-    phases_label = "Phase 2 → 3"
+    phases_label = "Phase 2"
+    if expander:
+        phases_label += " → 2b"
+    phases_label += " → 3"
     if disambiguator:
         phases_label += " → 4"
     print(f"Running {phases_label} evaluation...")
+    if disambiguator:
+        print(f"  LLM: {disambiguator.model}, top_k={args.llm_top_k}")
     print("=" * 60)
 
     total = 0
     p2_correct = 0
+    p2b_correct = 0  # Phase 2 + expansion
     p3_correct = 0
     p4_correct = 0
 
-    p3_improved_over_p2 = 0
-    p3_degraded_vs_p2 = 0
+    # Accuracy@k tracking
+    K_VALUES = [1, 5, 10, 20]
+    p2_at_k = {k: 0 for k in K_VALUES}   # Phase 2 Accuracy@k
+    p2b_at_k = {k: 0 for k in K_VALUES}  # Phase 2+expansion Accuracy@k
+    p3_at_k = {k: 0 for k in K_VALUES}   # Phase 2+expansion+Phase 3 Accuracy@k
+
+    p2b_improved_over_p2 = 0
+    p2b_degraded_vs_p2 = 0
+    p3_improved_over_p2b = 0
+    p3_degraded_vs_p2b = 0
     p4_improved_over_p3 = 0
     p4_degraded_vs_p3 = 0
+
+    # Expansion diagnostics
+    expansion_added_candidates = 0  # total new candidates added by expansion
+    expansion_added_gold = 0        # how often expansion brought the gold into the list
+    expansion_mentions_affected = 0 # how many mentions got new candidates
 
     llm_calls = 0
     llm_fallbacks = 0
@@ -213,10 +258,43 @@ def run_evaluation(args):
         p2_top1 = candidates[0].mesh_id
         p2_hit = p2_top1 in expanded_gold_ids
 
-        # ── Phase 3: Re-rank with domain rules ──
-        # Make copies of scores so Phase 3 doesn't modify Phase 2's view
-        p2_scores = {c.mesh_id: c.score for c in candidates}
+        # Accuracy@k for Phase 2
+        p2_ids = [c.mesh_id for c in candidates]
+        for k in K_VALUES:
+            if any(mid in expanded_gold_ids for mid in p2_ids[:k]):
+                p2_at_k[k] += 1
 
+        # ── Phase 2b: Candidate Expansion ──
+        p2_candidate_ids = {c.mesh_id for c in candidates}
+        if expander is not None:
+            # expansion_top_k must be at least as large as the input list
+            # so we never shrink the candidate list, only grow it
+            exp_top_k = max(args.expansion_top_k, len(candidates) + 10)
+            candidates = expander.expand(
+                mention=mention,
+                candidates=candidates,
+                entity_type=entity_type,
+                top_k=exp_top_k,
+            )
+            # Diagnostics: how many new candidates were added?
+            new_ids = {c.mesh_id for c in candidates} - p2_candidate_ids
+            if new_ids:
+                expansion_mentions_affected += 1
+                expansion_added_candidates += len(new_ids)
+                # Did expansion bring the gold into the list?
+                if new_ids & expanded_gold_ids:
+                    expansion_added_gold += 1
+
+        p2b_top1 = candidates[0].mesh_id
+        p2b_hit = p2b_top1 in expanded_gold_ids
+
+        # Accuracy@k for Phase 2b
+        p2b_ids = [c.mesh_id for c in candidates]
+        for k in K_VALUES:
+            if any(mid in expanded_gold_ids for mid in p2b_ids[:k]):
+                p2b_at_k[k] += 1
+
+        # ── Phase 3: Re-rank with domain rules ──
         reranked = reranker.rerank(
             mention=mention,
             candidates=candidates,
@@ -226,6 +304,12 @@ def run_evaluation(args):
 
         p3_top1 = reranked[0].mesh_id
         p3_hit = p3_top1 in expanded_gold_ids
+
+        # Accuracy@k for Phase 3
+        p3_ids = [c.mesh_id for c in reranked]
+        for k in K_VALUES:
+            if any(mid in expanded_gold_ids for mid in p3_ids[:k]):
+                p3_at_k[k] += 1
 
         # ── Phase 4: LLM disambiguation (optional) ──
         p4_top1 = p3_top1
@@ -257,45 +341,59 @@ def run_evaluation(args):
         # ── Track results ──
         if p2_hit:
             p2_correct += 1
+        if p2b_hit:
+            p2b_correct += 1
         if p3_hit:
             p3_correct += 1
         if p4_hit:
             p4_correct += 1
 
-        if p3_hit and not p2_hit:
-            p3_improved_over_p2 += 1
-        if p2_hit and not p3_hit:
-            p3_degraded_vs_p2 += 1
+        if p2b_hit and not p2_hit:
+            p2b_improved_over_p2 += 1
+        if p2_hit and not p2b_hit:
+            p2b_degraded_vs_p2 += 1
+        if p3_hit and not p2b_hit:
+            p3_improved_over_p2b += 1
+        if p2b_hit and not p3_hit:
+            p3_degraded_vs_p2b += 1
         if p4_hit and not p3_hit:
             p4_improved_over_p3 += 1
         if p3_hit and not p4_hit:
             p4_degraded_vs_p3 += 1
 
         # Log interesting changes
-        if p2_hit != p3_hit or p3_hit != p4_hit:
+        if p2_hit != p2b_hit or p2b_hit != p3_hit or p3_hit != p4_hit:
             changes_log.append({
                 "mention": mention,
                 "gold_id": gold_id,
                 "entity_type": entity_type,
                 "p2_top1": p2_top1,
-                "p2_label": candidates[0].preferred_label if candidates else "?",
+                "p2b_top1": p2b_top1,
                 "p3_top1": p3_top1,
                 "p3_label": reranked[0].preferred_label if reranked else "?",
                 "p4_top1": p4_top1,
                 "p2_correct": p2_hit,
+                "p2b_correct": p2b_hit,
                 "p3_correct": p3_hit,
                 "p4_correct": p4_hit,
                 "confidence": confidence,
             })
 
         total += 1
-        if total % 200 == 0:
+        # Print progress: every 50 with LLM, every 200 without
+        progress_interval = 50 if disambiguator else 200
+        if total % progress_interval == 0:
             elapsed = time.time() - t0
+            rate = total / elapsed if elapsed > 0 else 0
+            eta = (n_pairs - total) / rate if rate > 0 else 0
             line = (f"  ... {total}/{n_pairs} ({total*100//n_pairs}%) "
-                    f"— P2: {p2_correct*100/total:.1f}% "
-                    f"P3: {p3_correct*100/total:.1f}%")
+                    f"— P2: {p2_correct*100/total:.1f}%")
+            if expander is not None:
+                line += f" P2b: {p2b_correct*100/total:.1f}%"
+            line += f" P3: {p3_correct*100/total:.1f}%"
             if disambiguator:
                 line += f" P4: {p4_correct*100/total:.1f}%"
+            line += f" [{elapsed:.0f}s, ETA {eta:.0f}s]"
             print(line, flush=True)
 
     elapsed = time.time() - t0
@@ -306,18 +404,27 @@ def run_evaluation(args):
     print("=" * 60)
 
     p2_acc = p2_correct / total * 100 if total > 0 else 0
+    p2b_acc = p2b_correct / total * 100 if total > 0 else 0
     p3_acc = p3_correct / total * 100 if total > 0 else 0
     p4_acc = p4_correct / total * 100 if total > 0 else 0
 
     print(f"  Total mentions:              {total}")
     print(f"")
+
+    # ── Accuracy@1 per phase ──
     print(f"  Phase 2 Accuracy@1:          {p2_acc:.1f}% ({p2_correct}/{total})")
-    print(f"  Phase 2+3 Accuracy@1:        {p3_acc:.1f}% ({p3_correct}/{total})")
-    print(f"    P3 vs P2:                  {p3_acc - p2_acc:+.1f}% "
-          f"(+{p3_improved_over_p2} / -{p3_degraded_vs_p2})")
+
+    if expander is not None:
+        print(f"  Phase 2+2b Accuracy@1:       {p2b_acc:.1f}% ({p2b_correct}/{total})")
+        print(f"    P2b vs P2:                 {p2b_acc - p2_acc:+.1f}% "
+              f"(+{p2b_improved_over_p2} / -{p2b_degraded_vs_p2})")
+
+    print(f"  Phase 2(+2b)+3 Accuracy@1:   {p3_acc:.1f}% ({p3_correct}/{total})")
+    print(f"    P3 vs P2b:                 {p3_acc - p2b_acc:+.1f}% "
+          f"(+{p3_improved_over_p2b} / -{p3_degraded_vs_p2b})")
 
     if disambiguator:
-        print(f"  Phase 2+3+4 Accuracy@1:      {p4_acc:.1f}% ({p4_correct}/{total})")
+        print(f"  Phase 2+2b+3+4 Accuracy@1:   {p4_acc:.1f}% ({p4_correct}/{total})")
         print(f"    P4 vs P3:                  {p4_acc - p3_acc:+.1f}% "
               f"(+{p4_improved_over_p3} / -{p4_degraded_vs_p3})")
         print(f"    P4 vs P2:                  {p4_acc - p2_acc:+.1f}%")
@@ -325,26 +432,71 @@ def run_evaluation(args):
         print(f"  LLM calls:                   {llm_calls}")
         print(f"  LLM fallbacks (parse fail):  {llm_fallbacks}")
 
-    print(f"")
+    # ── Accuracy@k table ──
+    print(f"\n{'─' * 60}")
+    print(f"  Accuracy@k:")
+    print(f"  {'k':>3}  {'Phase 2':>12}  {'Phase 2+2b':>12}  {'Phase 2b+3':>12}")
+    for k in K_VALUES:
+        p2_k = p2_at_k[k] / total * 100 if total > 0 else 0
+        p2b_k = p2b_at_k[k] / total * 100 if total > 0 else 0
+        p3_k = p3_at_k[k] / total * 100 if total > 0 else 0
+        diff_str = f"(+{p2b_k - p2_k:.1f})" if p2b_k > p2_k else ""
+        print(f"  {k:>3}  {p2_k:>11.1f}%  {p2b_k:>11.1f}%  {p3_k:>11.1f}%  {diff_str}")
+
+    # ── Expansion diagnostics ──
+    if expander is not None:
+        print(f"\n{'─' * 60}")
+        print(f"  Expansion diagnostics:")
+        print(f"    Mentions with new candidates:  {expansion_mentions_affected}/{total} "
+              f"({expansion_mentions_affected*100/total:.1f}%)")
+        print(f"    Total new candidates added:    {expansion_added_candidates}")
+        if expansion_mentions_affected > 0:
+            print(f"    Avg new candidates per mention:{expansion_added_candidates/expansion_mentions_affected:.1f}")
+        print(f"    Gold brought into list:        {expansion_added_gold} "
+              f"({expansion_added_gold*100/total:.2f}%)")
+
+    print(f"\n{'─' * 60}")
+    expansion_str = "ON" if expander else "OFF"
+    print(f"  Candidate expansion:         {expansion_str}")
+    if expander:
+        print(f"  Expansion top_k:             {args.expansion_top_k}")
     print(f"  Rule weights: R5={args.rule5_boost}, R6={args.rule6_penalty}, R7={args.rule7_boost}")
     print(f"  Time: {elapsed:.0f}s")
 
     # ── Show example changes ──
     if changes_log:
-        improvements_p3 = [r for r in changes_log if r["p3_correct"] and not r["p2_correct"]]
-        degradations_p3 = [r for r in changes_log if r["p2_correct"] and not r["p3_correct"]]
+        # Phase 2b vs Phase 2
+        if expander is not None:
+            improvements_p2b = [r for r in changes_log if r["p2b_correct"] and not r["p2_correct"]]
+            degradations_p2b = [r for r in changes_log if r["p2_correct"] and not r["p2b_correct"]]
+
+            if improvements_p2b:
+                print(f"\n── Expansion IMPROVED over Phase 2 ({len(improvements_p2b)} total) ──")
+                for r in improvements_p2b[:5]:
+                    print(f'  "{r["mention"]}" [{r["entity_type"]}] gold={r["gold_id"]}')
+                    print(f"    P2: {r['p2_top1']} → P2b: {r['p2b_top1']} (correct)")
+
+            if degradations_p2b:
+                print(f"\n── Expansion DEGRADED vs Phase 2 ({len(degradations_p2b)} total) ──")
+                for r in degradations_p2b[:5]:
+                    print(f'  "{r["mention"]}" [{r["entity_type"]}] gold={r["gold_id"]}')
+                    print(f"    P2: {r['p2_top1']} (correct) → P2b: {r['p2b_top1']} (wrong)")
+
+        # Phase 3 vs Phase 2b
+        improvements_p3 = [r for r in changes_log if r["p3_correct"] and not r["p2b_correct"]]
+        degradations_p3 = [r for r in changes_log if r["p2b_correct"] and not r["p3_correct"]]
 
         if improvements_p3:
-            print(f"\n── Phase 3 IMPROVED over Phase 2 ({len(improvements_p3)} total) ──")
+            print(f"\n── Phase 3 IMPROVED over Phase 2b ({len(improvements_p3)} total) ──")
             for r in improvements_p3[:3]:
                 print(f'  "{r["mention"]}" [{r["entity_type"]}] gold={r["gold_id"]}')
-                print(f"    P2: {r['p2_top1']} (wrong) → P3: {r['p3_top1']} (correct)")
+                print(f"    P2b: {r['p2b_top1']} (wrong) → P3: {r['p3_top1']} (correct)")
 
         if degradations_p3:
-            print(f"\n── Phase 3 DEGRADED vs Phase 2 ({len(degradations_p3)} total) ──")
+            print(f"\n── Phase 3 DEGRADED vs Phase 2b ({len(degradations_p3)} total) ──")
             for r in degradations_p3[:3]:
                 print(f'  "{r["mention"]}" [{r["entity_type"]}] gold={r["gold_id"]}')
-                print(f"    P2: {r['p2_top1']} (correct) → P3: {r['p3_top1']} (wrong)")
+                print(f"    P2b: {r['p2b_top1']} (correct) → P3: {r['p3_top1']} (wrong)")
 
         if disambiguator:
             improvements_p4 = [r for r in changes_log if r["p4_correct"] and not r["p3_correct"]]
@@ -368,8 +520,22 @@ def run_evaluation(args):
         json.dump({
             "total": total,
             "phase2_accuracy": p2_acc,
+            "phase2b_accuracy": p2b_acc if expander else None,
             "phase3_accuracy": p3_acc,
             "phase4_accuracy": p4_acc if disambiguator else None,
+            "accuracy_at_k": {
+                f"phase2@{k}": p2_at_k[k] / total * 100 if total else 0 for k in K_VALUES
+            } | {
+                f"phase2b@{k}": p2b_at_k[k] / total * 100 if total else 0 for k in K_VALUES
+            } | {
+                f"phase3@{k}": p3_at_k[k] / total * 100 if total else 0 for k in K_VALUES
+            },
+            "expansion_enabled": expander is not None,
+            "expansion_diagnostics": {
+                "mentions_affected": expansion_mentions_affected,
+                "candidates_added": expansion_added_candidates,
+                "gold_brought_in": expansion_added_gold,
+            } if expander else None,
             "changes": changes_log,
         }, f, indent=2)
     print(f"\nDetailed log saved to {log_path}")
@@ -386,6 +552,11 @@ if __name__ == "__main__":
     parser.add_argument("--dbpedia", action="store_true", help="DBpedia enrichment")
     parser.add_argument("--umls", type=str, default=None, help="Path to MRCONSO.RRF")
 
+    # Phase 2b: Expansion settings
+    parser.add_argument("--no-expansion", action="store_true", help="Skip candidate expansion (UMLS bridge, multi-word, parent)")
+    parser.add_argument("--mrrel", type=str, default=None, help="Path to MRREL.RRF for UMLS bridge expansion")
+    parser.add_argument("--expansion-top-k", type=int, default=30, help="Max candidates after expansion (default: 30)")
+
     # Phase 3 settings
     parser.add_argument("--rule5-boost", type=float, default=2.0)
     parser.add_argument("--rule6-penalty", type=float, default=-30.0)
@@ -396,7 +567,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", default="qwen3-4b-2507", help="LLM model name")
     parser.add_argument("--base-url", default="http://localhost:1234/v1", help="LLM API URL")
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--llm-top-k", type=int, default=5, help="Candidates to pass to LLM")
+    parser.add_argument("--llm-top-k", type=int, default=10, help="Candidates to pass to LLM")
 
     # Evaluation settings
     parser.add_argument("--limit", type=int, default=None, help="Limit to N mentions")
