@@ -53,6 +53,7 @@ from abbreviation_expander import AbbreviationExpander
 
 try:
     from embedding_retriever import EmbeddingRetriever
+    from hybrid_scorer import HybridScorer
     HAS_EMBEDDING = True
 except ImportError:
     HAS_EMBEDDING = False
@@ -167,6 +168,7 @@ class BioLinkerPipeline:
         use_abbreviation_expansion: bool = True,
         use_embedding_retrieval: bool = False,
         embedding_model: str = "cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
+        hybrid_alpha: float = 0.7,
     ):
         self.top_k = top_k
         self.llm_top_k = llm_top_k
@@ -178,8 +180,9 @@ class BioLinkerPipeline:
         # ── Improvement: Abbreviation Expander ──
         self.abbreviation_expander = AbbreviationExpander() if use_abbreviation_expansion else None
 
-        # ── Improvement: Embedding Retriever ──
+        # ── Improvement: Embedding Retriever + Hybrid Scorer ──
         self.embedding_retriever = None
+        self.hybrid_scorer = None
         self.use_embedding_retrieval = use_embedding_retrieval
 
         # ── Phase 1: Linguistic Entity Extractor (lazy init) ──
@@ -207,6 +210,7 @@ class BioLinkerPipeline:
                 model_name=embedding_model,
             )
             self.embedding_retriever.build_or_load(cache_dir)
+            self.hybrid_scorer = HybridScorer(self.embedding_retriever, alpha=hybrid_alpha)
         elif use_embedding_retrieval and not HAS_EMBEDDING:
             print("Warning: Embedding retrieval requested but torch/transformers/faiss not installed.")
 
@@ -448,7 +452,7 @@ class BioLinkerPipeline:
                     candidates.append(ec)
                     existing_ids.add(ec.mesh_id)
 
-        # ── Embedding retrieval (hybrid merge) ──
+        # ── Embedding retrieval (hybrid merge + re-scoring) ──
         if self.embedding_retriever is not None:
             emb_candidates = self.embedding_retriever.retrieve(mention, top_k=self.top_k)
             existing_ids = {c.mesh_id for c in candidates}
@@ -456,6 +460,9 @@ class BioLinkerPipeline:
                 if ec.mesh_id not in existing_ids:
                     candidates.append(ec)
                     existing_ids.add(ec.mesh_id)
+            # Hybrid re-scoring
+            if self.hybrid_scorer is not None:
+                candidates = self.hybrid_scorer.rescore(mention, candidates)
 
         if not candidates:
             return LinkingResult(

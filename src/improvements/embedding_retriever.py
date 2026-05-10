@@ -148,7 +148,7 @@ class EmbeddingRetriever:
         embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
         return embeddings.cpu().numpy()
 
-    def encode_texts(self, texts: list[str]) -> np.ndarray:
+    def encode_texts(self, texts: list[str], verbose: bool = False) -> np.ndarray:
         """
         Encode a list of texts into embeddings, processing in batches.
 
@@ -156,6 +156,8 @@ class EmbeddingRetriever:
         ----------
         texts : list[str]
             Texts to encode.
+        verbose : bool
+            If True, print progress (useful for large index builds).
 
         Returns
         -------
@@ -170,10 +172,11 @@ class EmbeddingRetriever:
             embs = self._encode_batch(batch)
             all_embeddings.append(embs)
 
-            batch_num = i // self.batch_size + 1
-            if batch_num % 50 == 0 or batch_num == n_batches:
-                print(f"  Encoded {min(i + self.batch_size, len(texts))}/{len(texts)} labels "
-                      f"({batch_num}/{n_batches} batches)", flush=True)
+            if verbose:
+                batch_num = i // self.batch_size + 1
+                if batch_num % 50 == 0 or batch_num == n_batches:
+                    print(f"  Encoded {min(i + self.batch_size, len(texts))}/{len(texts)} labels "
+                          f"({batch_num}/{n_batches} batches)", flush=True)
 
         return np.vstack(all_embeddings)
 
@@ -220,7 +223,7 @@ class EmbeddingRetriever:
 
         # Encode all labels
         print(f"  Encoding with {self.model_name}...")
-        embeddings = self.encode_texts(labels)
+        embeddings = self.encode_texts(labels, verbose=True)
         self._embedding_dim = embeddings.shape[1]
 
         # Build FAISS index (inner product = cosine similarity for normalized vectors)
@@ -366,6 +369,48 @@ class EmbeddingRetriever:
         # Sort by score descending and return top_k
         candidates.sort(key=lambda c: c.score, reverse=True)
         return candidates[:top_k]
+
+    def score_candidates(self, mention: str, candidates: list) -> dict[str, float]:
+        """
+        Compute embedding similarity between a mention and existing candidates.
+
+        For each candidate, encodes its preferred_label (and best synonym)
+        and returns the max cosine similarity to the mention.
+
+        Parameters
+        ----------
+        mention : str
+            The entity mention.
+        candidates : list[CandidateEntity]
+            Existing candidates to score.
+
+        Returns
+        -------
+        dict[str, float]
+            mesh_id → embedding similarity score (0-100 scale).
+        """
+        if not candidates:
+            return {}
+
+        # Encode the mention
+        mention_emb = self._encode_batch([mention])  # (1, dim)
+
+        # Collect all labels to score (preferred label per candidate)
+        # We use preferred_label as the representative text
+        labels = [c.preferred_label for c in candidates]
+
+        # Encode all labels in one batch for efficiency
+        label_embs = self.encode_texts(labels)  # (n, dim)
+
+        # Cosine similarity (vectors are already normalized)
+        similarities = np.dot(label_embs, mention_emb.T).flatten()  # (n,)
+
+        # Map to mesh_id, scaled to 0-100
+        scores = {}
+        for c, sim in zip(candidates, similarities):
+            scores[c.mesh_id] = float(sim) * 100.0
+
+        return scores
 
     def retrieve_with_details(self, mention: str, top_k: int = 10) -> dict:
         """

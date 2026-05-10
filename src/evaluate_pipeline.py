@@ -54,6 +54,7 @@ from abbreviation_expander import AbbreviationExpander
 
 try:
     from embedding_retriever import EmbeddingRetriever
+    from hybrid_scorer import HybridScorer
     HAS_EMBEDDING = True
 except ImportError:
     HAS_EMBEDDING = False
@@ -185,11 +186,18 @@ def run_evaluation(args):
         )
         emb_retriever.build_or_load(cache_dir)
         print(f"  Embedding retriever: ENABLED ({args.embedding_model})")
+        print(f"  Hybrid scoring: alpha={args.hybrid_alpha} "
+              f"({args.hybrid_alpha*100:.0f}% string + {(1-args.hybrid_alpha)*100:.0f}% embedding)")
     elif args.embedding and not HAS_EMBEDDING:
         print("  Embedding retriever: DISABLED (torch/transformers/faiss not installed)")
         print("    Install with: pip install torch transformers faiss-cpu")
     else:
         print("  Embedding retriever: DISABLED")
+
+    # ── Step 4d: Hybrid Scorer (created alongside embedding retriever) ──
+    hybrid_scorer = None
+    if emb_retriever is not None:
+        hybrid_scorer = HybridScorer(emb_retriever, alpha=args.hybrid_alpha)
 
     # ── Step 5: Load BC5CDR test set ──
     print("\n" + "=" * 60)
@@ -324,7 +332,7 @@ def run_evaluation(args):
                 if candidates[0].mesh_id in expanded_gold_ids and p2_original_top1 not in expanded_gold_ids:
                     abbrev_improved_count += 1
 
-        # ── Embedding retrieval (hybrid merge) ──
+        # ── Embedding retrieval (hybrid merge + re-scoring) ──
         if emb_retriever is not None:
             emb_candidates = emb_retriever.retrieve(mention, top_k=args.top_k)
             if emb_candidates:
@@ -334,6 +342,10 @@ def run_evaluation(args):
                     if ec.mesh_id not in existing_ids:
                         candidates.append(ec)
                         existing_ids.add(ec.mesh_id)
+
+            # Hybrid re-scoring: combine string + embedding scores
+            if hybrid_scorer is not None:
+                candidates = hybrid_scorer.rescore(mention, candidates)
 
         if not candidates:
             total += 1
@@ -661,6 +673,8 @@ if __name__ == "__main__":
     parser.add_argument("--embedding-model", default="cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
                         help="HuggingFace model for embedding retrieval")
     parser.add_argument("--embedding-batch-size", type=int, default=256, help="Batch size for encoding")
+    parser.add_argument("--hybrid-alpha", type=float, default=0.7,
+                        help="Hybrid scoring weight: 0=pure embedding, 1=pure string (default: 0.7)")
 
     # Phase 3 settings
     parser.add_argument("--rule5-boost", type=float, default=2.0)
