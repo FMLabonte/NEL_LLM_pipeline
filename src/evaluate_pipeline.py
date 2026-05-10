@@ -41,6 +41,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "src" / "candidate-generation"))
 sys.path.insert(0, str(PROJECT_ROOT / "src" / "domain-rules"))
 sys.path.insert(0, str(PROJECT_ROOT / "src" / "llm-disambiguation"))
+sys.path.insert(0, str(PROJECT_ROOT / "src" / "improvements"))
 
 from pubtator_parser import parse_pubtator
 from mesh_index import MeSHIndex
@@ -49,6 +50,7 @@ from candidate_expander import CandidateExpander
 from umls_relation_expander import UMLSRelationExpander
 from domain_rules import DomainRuleReranker
 from llm_disambiguator import LLMDisambiguator
+from abbreviation_expander import AbbreviationExpander
 
 
 def extract_sentence(text: str, mention: str, start: int = -1, window: int = 200) -> str:
@@ -158,6 +160,14 @@ def run_evaluation(args):
             print(f"Warning: Could not connect to LLM: {e}")
             print("Phase 4 will be skipped.")
 
+    # ── Step 4b: Abbreviation Expander (optional) ──
+    abbrev_expander = None
+    if not args.no_abbreviation_expansion:
+        abbrev_expander = AbbreviationExpander()
+        print("  Abbreviation expander: ENABLED")
+    else:
+        print("  Abbreviation expander: DISABLED")
+
     # ── Step 5: Load BC5CDR test set ──
     print("\n" + "=" * 60)
     print("Loading BC5CDR test set...")
@@ -195,7 +205,10 @@ def run_evaluation(args):
 
     # ── Step 6: Run evaluation ──
     print("\n" + "=" * 60)
-    phases_label = "Phase 2"
+    phases_label = ""
+    if abbrev_expander:
+        phases_label += "Abbrev → "
+    phases_label += "Phase 2"
     if expander:
         phases_label += " → 2b"
     phases_label += " → 3"
@@ -230,6 +243,10 @@ def run_evaluation(args):
     expansion_added_gold = 0        # how often expansion brought the gold into the list
     expansion_mentions_affected = 0 # how many mentions got new candidates
 
+    # Abbreviation expansion diagnostics
+    abbrev_expanded_count = 0     # how many mentions were expanded
+    abbrev_improved_count = 0     # how many went from wrong to correct thanks to expansion
+
     llm_calls = 0
     llm_fallbacks = 0
 
@@ -249,8 +266,41 @@ def run_evaluation(args):
             if gid in id_map:
                 expanded_gold_ids.update(id_map[gid])
 
+        # ── Pre-Phase 2: Abbreviation Expansion ──
+        abbreviation_expanded = None
+        if abbrev_expander is not None:
+            ctx = context_lookup.get(pmid, {})
+            full_text = ctx.get("full_text", "")
+            doc_title = ctx.get("title", "")
+            expanded = abbrev_expander.expand_mention(
+                mention, context=full_text, title=doc_title,
+            )
+            if expanded:
+                abbreviation_expanded = expanded
+                abbrev_expanded_count += 1
+
         # ── Phase 2: Retrieve candidates ──
         candidates = retriever.retrieve(mention, top_k=args.top_k)
+
+        # If abbreviation was expanded, also retrieve for expanded form and merge
+        p2_original_top1 = candidates[0].mesh_id if candidates else "NONE"
+        if abbreviation_expanded:
+            expanded_candidates = retriever.retrieve(
+                abbreviation_expanded, top_k=args.top_k,
+            )
+            if expanded_candidates:
+                # Merge both sets, keeping the highest score per mesh_id
+                by_id = {}
+                for c in candidates:
+                    by_id[c.mesh_id] = c
+                for ec in expanded_candidates:
+                    if ec.mesh_id not in by_id or ec.score > by_id[ec.mesh_id].score:
+                        by_id[ec.mesh_id] = ec
+                candidates = sorted(by_id.values(), key=lambda c: c.score, reverse=True)
+                # Track if expansion changed top-1
+                if candidates[0].mesh_id in expanded_gold_ids and p2_original_top1 not in expanded_gold_ids:
+                    abbrev_improved_count += 1
+
         if not candidates:
             total += 1
             continue
@@ -455,11 +505,21 @@ def run_evaluation(args):
         print(f"    Gold brought into list:        {expansion_added_gold} "
               f"({expansion_added_gold*100/total:.2f}%)")
 
+    # ── Abbreviation expansion diagnostics ──
+    if abbrev_expander is not None:
+        print(f"\n{'─' * 60}")
+        print(f"  Abbreviation expansion diagnostics:")
+        print(f"    Mentions expanded:             {abbrev_expanded_count}/{total} "
+              f"({abbrev_expanded_count*100/total:.1f}%)")
+        print(f"    Directly improved top-1:       {abbrev_improved_count}")
+
     print(f"\n{'─' * 60}")
     expansion_str = "ON" if expander else "OFF"
     print(f"  Candidate expansion:         {expansion_str}")
     if expander:
         print(f"  Expansion top_k:             {args.expansion_top_k}")
+    abbrev_str = "ON" if abbrev_expander else "OFF"
+    print(f"  Abbreviation expansion:      {abbrev_str}")
     print(f"  Rule weights: R5={args.rule5_boost}, R6={args.rule6_penalty}, R7={args.rule7_boost}")
     print(f"  Time: {elapsed:.0f}s")
 
@@ -556,6 +616,9 @@ if __name__ == "__main__":
     parser.add_argument("--no-expansion", action="store_true", help="Skip candidate expansion (UMLS bridge, multi-word, parent)")
     parser.add_argument("--mrrel", type=str, default=None, help="Path to MRREL.RRF for UMLS bridge expansion")
     parser.add_argument("--expansion-top-k", type=int, default=30, help="Max candidates after expansion (default: 30)")
+
+    # Abbreviation expansion
+    parser.add_argument("--no-abbreviation-expansion", action="store_true", help="Skip abbreviation expansion")
 
     # Phase 3 settings
     parser.add_argument("--rule5-boost", type=float, default=2.0)

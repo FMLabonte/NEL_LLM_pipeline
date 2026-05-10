@@ -41,6 +41,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src" / "candidate-generation"))
 sys.path.insert(0, str(PROJECT_ROOT / "src" / "domain-rules"))
 sys.path.insert(0, str(PROJECT_ROOT / "src" / "llm-disambiguation"))
 sys.path.insert(0, str(PROJECT_ROOT / "src" / "linguistic-rules"))
+sys.path.insert(0, str(PROJECT_ROOT / "src" / "improvements"))
 
 from mesh_index import MeSHIndex
 from candidate_retriever import CandidateRetriever
@@ -48,6 +49,7 @@ from candidate_expander import CandidateExpander
 from umls_relation_expander import UMLSRelationExpander
 from domain_rules import DomainRuleReranker
 from llm_disambiguator import LLMDisambiguator
+from abbreviation_expander import AbbreviationExpander
 
 
 # ── Result data class ─────────────────────────────────────────────────────
@@ -156,12 +158,17 @@ class BioLinkerPipeline:
         rule5_boost: float = 2.0,
         rule6_penalty: float = -30.0,
         rule7_boost: float = 3.0,
+        use_abbreviation_expansion: bool = True,
     ):
         self.top_k = top_k
         self.llm_top_k = llm_top_k
         self.use_expansion = use_expansion
         self.use_phase3 = use_phase3
         self.use_phase4 = use_phase4
+        self.use_abbreviation_expansion = use_abbreviation_expansion
+
+        # ── Improvement: Abbreviation Expander ──
+        self.abbreviation_expander = AbbreviationExpander() if use_abbreviation_expansion else None
 
         # ── Phase 1: Linguistic Entity Extractor (lazy init) ──
         self._extractor = None
@@ -332,6 +339,12 @@ class BioLinkerPipeline:
         list[LinkingResult]
             One result per entity mention.
         """
+        # Pre-extract abbreviations from the document text once
+        doc_abbreviations = {}
+        if self.use_abbreviation_expansion and self.abbreviation_expander is not None:
+            full_text = (title + " " + context) if title else context
+            doc_abbreviations = self.abbreviation_expander.extract_abbreviations(full_text)
+
         results = []
 
         for entity in gold_entities:
@@ -343,6 +356,7 @@ class BioLinkerPipeline:
                 entity_type=entity_type,
                 context=context,
                 title=title,
+                doc_abbreviations=doc_abbreviations,
             )
             results.append(result)
 
@@ -354,6 +368,7 @@ class BioLinkerPipeline:
         entity_type: str | None = None,
         context: str = "",
         title: str = "",
+        doc_abbreviations: dict | None = None,
     ) -> LinkingResult:
         """
         Link a single mention through Phase 2 → 3 → 4.
@@ -368,13 +383,47 @@ class BioLinkerPipeline:
             Document text for context-based rules.
         title : str
             Paper title for LLM prompting.
+        doc_abbreviations : dict or None
+            Pre-extracted abbreviations from the document (from link_entities).
 
         Returns
         -------
         LinkingResult
         """
+        # ── Pre-Phase 2: Abbreviation Expansion ──
+        # If the mention looks like an abbreviation, also search for
+        # its expanded form and merge results.
+        abbreviation_expanded = None
+        if self.use_abbreviation_expansion and self.abbreviation_expander is not None:
+            # First check pre-extracted abbreviations from the document
+            mention_upper = mention.upper().strip()
+            if doc_abbreviations and mention_upper in doc_abbreviations:
+                abbreviation_expanded = doc_abbreviations[mention_upper].expansion
+            elif doc_abbreviations and mention.strip() in doc_abbreviations:
+                abbreviation_expanded = doc_abbreviations[mention.strip()].expansion
+            else:
+                # Fallback: try expanding from the context or dictionary
+                expanded = self.abbreviation_expander.expand_mention(
+                    mention, context=context, title=title,
+                )
+                if expanded:
+                    abbreviation_expanded = expanded
+
         # ── Phase 2: Candidate Generation ──
+        # Search for the original mention (and expanded form if available)
         candidates = self.retriever.retrieve(mention, top_k=self.top_k)
+
+        if abbreviation_expanded:
+            # Also retrieve candidates for the expanded form
+            expanded_candidates = self.retriever.retrieve(
+                abbreviation_expanded, top_k=self.top_k,
+            )
+            # Merge: add expanded candidates not already in the list
+            existing_ids = {c.mesh_id for c in candidates}
+            for ec in expanded_candidates:
+                if ec.mesh_id not in existing_ids:
+                    candidates.append(ec)
+                    existing_ids.add(ec.mesh_id)
 
         if not candidates:
             return LinkingResult(
