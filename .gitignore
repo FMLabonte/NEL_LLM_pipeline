@@ -38,6 +38,7 @@ en_core_sci_sm*/
 # Enrichment caches (generated locally, kept in src/candidate-generation/cache/)
 src/candidate-generation/cache/*.json
 src/candidate-generation/cache/umls_bridge_cache.json
+src/improvements/cache/**
 
 # UMLS data (requires license, download separately)
 Data/UMLS/

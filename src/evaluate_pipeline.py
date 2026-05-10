@@ -52,6 +52,12 @@ from domain_rules import DomainRuleReranker
 from llm_disambiguator import LLMDisambiguator
 from abbreviation_expander import AbbreviationExpander
 
+try:
+    from embedding_retriever import EmbeddingRetriever
+    HAS_EMBEDDING = True
+except ImportError:
+    HAS_EMBEDDING = False
+
 
 def extract_sentence(text: str, mention: str, start: int = -1, window: int = 200) -> str:
     """Extract a sentence-level context window around the mention."""
@@ -167,6 +173,23 @@ def run_evaluation(args):
         print("  Abbreviation expander: ENABLED")
     else:
         print("  Abbreviation expander: DISABLED")
+
+    # ── Step 4c: Embedding Retriever (optional) ──
+    emb_retriever = None
+    if args.embedding and HAS_EMBEDDING:
+        cache_dir = str(PROJECT_ROOT / "src" / "improvements" / "cache" / "faiss")
+        emb_retriever = EmbeddingRetriever(
+            mesh_index=index,
+            model_name=args.embedding_model,
+            batch_size=args.embedding_batch_size,
+        )
+        emb_retriever.build_or_load(cache_dir)
+        print(f"  Embedding retriever: ENABLED ({args.embedding_model})")
+    elif args.embedding and not HAS_EMBEDDING:
+        print("  Embedding retriever: DISABLED (torch/transformers/faiss not installed)")
+        print("    Install with: pip install torch transformers faiss-cpu")
+    else:
+        print("  Embedding retriever: DISABLED")
 
     # ── Step 5: Load BC5CDR test set ──
     print("\n" + "=" * 60)
@@ -300,6 +323,17 @@ def run_evaluation(args):
                 # Track if expansion changed top-1
                 if candidates[0].mesh_id in expanded_gold_ids and p2_original_top1 not in expanded_gold_ids:
                     abbrev_improved_count += 1
+
+        # ── Embedding retrieval (hybrid merge) ──
+        if emb_retriever is not None:
+            emb_candidates = emb_retriever.retrieve(mention, top_k=args.top_k)
+            if emb_candidates:
+                # Merge: add embedding candidates not already in the list
+                existing_ids = {c.mesh_id for c in candidates}
+                for ec in emb_candidates:
+                    if ec.mesh_id not in existing_ids:
+                        candidates.append(ec)
+                        existing_ids.add(ec.mesh_id)
 
         if not candidates:
             total += 1
@@ -520,6 +554,8 @@ def run_evaluation(args):
         print(f"  Expansion top_k:             {args.expansion_top_k}")
     abbrev_str = "ON" if abbrev_expander else "OFF"
     print(f"  Abbreviation expansion:      {abbrev_str}")
+    emb_str = f"ON ({args.embedding_model})" if emb_retriever else "OFF"
+    print(f"  Embedding retrieval:         {emb_str}")
     print(f"  Rule weights: R5={args.rule5_boost}, R6={args.rule6_penalty}, R7={args.rule7_boost}")
     print(f"  Time: {elapsed:.0f}s")
 
@@ -619,6 +655,12 @@ if __name__ == "__main__":
 
     # Abbreviation expansion
     parser.add_argument("--no-abbreviation-expansion", action="store_true", help="Skip abbreviation expansion")
+
+    # Embedding retrieval
+    parser.add_argument("--embedding", action="store_true", help="Enable embedding-based retrieval (SapBERT + FAISS)")
+    parser.add_argument("--embedding-model", default="cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
+                        help="HuggingFace model for embedding retrieval")
+    parser.add_argument("--embedding-batch-size", type=int, default=256, help="Batch size for encoding")
 
     # Phase 3 settings
     parser.add_argument("--rule5-boost", type=float, default=2.0)
