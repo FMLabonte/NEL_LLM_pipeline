@@ -152,7 +152,7 @@ class BioLinkerPipeline:
         use_phase3: bool = True,
         use_phase4: bool = True,
         mrrel_path: str | None = None,
-        llm_model: str = "qwen3-4b-2507",
+        llm_model: str = "qwen3.5-9b",
         llm_base_url: str = "http://localhost:1234/v1",
         llm_top_k: int = 10,
         rule5_boost: float = 2.0,

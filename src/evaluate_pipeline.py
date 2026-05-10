@@ -627,9 +627,9 @@ if __name__ == "__main__":
 
     # Phase 4 settings
     parser.add_argument("--no-phase4", action="store_true", help="Skip Phase 4 (LLM)")
-    parser.add_argument("--model", default="qwen3-4b-2507", help="LLM model name")
+    parser.add_argument("--model", default="qwen3.5-9b", help="LLM model name")
     parser.add_argument("--base-url", default="http://localhost:1234/v1", help="LLM API URL")
-    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--llm-top-k", type=int, default=10, help="Candidates to pass to LLM")
 
     # Evaluation settings

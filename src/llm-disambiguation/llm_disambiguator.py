@@ -66,7 +66,9 @@ Your job: Select the candidate that best matches the mention IN CONTEXT. Conside
 - Whether the candidate's definition fits the usage
 - Synonyms and alternative names
 
-IMPORTANT: Respond with ONLY the number of your chosen candidate (e.g., "1" or "3"). Nothing else. If none of the candidates match, respond with "NONE".
+Think step by step: First, identify what the mention refers to in this context. Then, compare it against the candidates and pick the best match.
+
+Respond with your reasoning in 1-2 sentences, then on a new line write ONLY the number of your chosen candidate (e.g., "1" or "3"). If none of the candidates match, write "NONE".
 """
 
 def _extract_mention_window(context: str, mention: str, n_sentences: int = 2) -> str:
@@ -171,24 +173,49 @@ def _build_user_prompt(
     return "\n".join(parts)
 
 
+def _strip_thinking_tags(response: str) -> str:
+    """
+    Strip <think>...</think> blocks from model output.
+    Qwen3.5 and similar models emit thinking tokens wrapped in these tags.
+    """
+    return re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
+
+
 def _parse_llm_response(response: str, num_candidates: int) -> int | None:
-    text = response.strip()
+    # Strip thinking tags (Qwen3.5 outputs <think>...</think> before answer)
+    text = _strip_thinking_tags(response).strip()
 
     # Check for case NONE
     if text.upper() == "NONE":
         return None
 
-    # Try to extract a number, handle cases like "1", "1.", "Candidate 1", "The best match is 1", etc.
+    # Try to extract a number from the LAST line (CoT reasoning comes first)
+    lines = [l.strip() for l in text.strip().split('\n') if l.strip()]
+    if lines:
+        last_line = lines[-1]
+        # If last line is just a number
+        if last_line.isdigit():
+            num = int(last_line)
+            if 1 <= num <= num_candidates:
+                return num
+        # If last line contains a number
+        match = re.search(r'\b(\d+)\b', last_line)
+        if match:
+            num = int(match.group(1))
+            if 1 <= num <= num_candidates:
+                return num
+
+    # Fallback: find any number in the full response
     # First try: just a plain number
     if text.isdigit():
         num = int(text)
         if 1 <= num <= num_candidates:
             return num
 
-    # Second try: find the first number in the response
-    match = re.search(r'\b(\d+)\b', text)
-    if match:
-        num = int(match.group(1))
+    # Second try: find the last number in the response (most likely the answer)
+    matches = re.findall(r'\b(\d+)\b', text)
+    if matches:
+        num = int(matches[-1])
         if 1 <= num <= num_candidates:
             return num
 
@@ -206,11 +233,11 @@ class LLMDisambiguator:
 
     def __init__(
         self,
-        model: str = "qwen3-4b-2507",
+        model: str = "qwen3.5-9b",
         base_url: str = "http://localhost:1234/v1",
-        temperature: float = 0.0,
-        max_tokens: int = 32,
-        timeout: float = 30.0,
+        temperature: float = 0.6,
+        max_tokens: int = 512,
+        timeout: float = 60.0,
     ):
         self.model = model
         self.temperature = temperature
