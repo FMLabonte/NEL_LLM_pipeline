@@ -50,6 +50,14 @@ from umls_relation_expander import UMLSRelationExpander
 from domain_rules import DomainRuleReranker
 from llm_disambiguator import LLMDisambiguator
 from abbreviation_expander import AbbreviationExpander
+from string_normalizer import generate_variants
+
+try:
+    from embedding_retriever import EmbeddingRetriever
+    from hybrid_scorer import HybridScorer
+    HAS_EMBEDDING = True
+except ImportError:
+    HAS_EMBEDDING = False
 
 
 # ── Result data class ─────────────────────────────────────────────────────
@@ -159,6 +167,9 @@ class BioLinkerPipeline:
         rule6_penalty: float = -30.0,
         rule7_boost: float = 3.0,
         use_abbreviation_expansion: bool = True,
+        use_embedding_retrieval: bool = False,
+        embedding_model: str = "cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
+        hybrid_alpha: float = 0.7,
     ):
         self.top_k = top_k
         self.llm_top_k = llm_top_k
@@ -169,6 +180,11 @@ class BioLinkerPipeline:
 
         # ── Improvement: Abbreviation Expander ──
         self.abbreviation_expander = AbbreviationExpander() if use_abbreviation_expansion else None
+
+        # ── Improvement: Embedding Retriever + Hybrid Scorer ──
+        self.embedding_retriever = None
+        self.hybrid_scorer = None
+        self.use_embedding_retrieval = use_embedding_retrieval
 
         # ── Phase 1: Linguistic Entity Extractor (lazy init) ──
         self._extractor = None
@@ -186,6 +202,18 @@ class BioLinkerPipeline:
                 enrich_umls=enrich_umls,
             )
         self.retriever = CandidateRetriever(self.index, top_k=top_k)
+
+        # ── Embedding Retriever (optional) ──
+        if use_embedding_retrieval and HAS_EMBEDDING:
+            cache_dir = str(PROJECT_ROOT / "src" / "improvements" / "cache" / "faiss")
+            self.embedding_retriever = EmbeddingRetriever(
+                mesh_index=self.index,
+                model_name=embedding_model,
+            )
+            self.embedding_retriever.build_or_load(cache_dir)
+            self.hybrid_scorer = HybridScorer(self.embedding_retriever, alpha=hybrid_alpha)
+        elif use_embedding_retrieval and not HAS_EMBEDDING:
+            print("Warning: Embedding retrieval requested but torch/transformers/faiss not installed.")
 
         # ── Phase 2b: Candidate Expansion (UMLS bridge + multi-word + parent) ──
         self.expander = None
@@ -410,8 +438,16 @@ class BioLinkerPipeline:
                     abbreviation_expanded = expanded
 
         # ── Phase 2: Candidate Generation ──
-        # Search for the original mention (and expanded form if available)
+        # Search original mention + normalized variants
         candidates = self.retriever.retrieve(mention, top_k=self.top_k)
+        variants = generate_variants(mention)
+        existing_ids = {c.mesh_id for c in candidates}
+        for variant in variants[1:]:  # skip first (= original)
+            var_candidates = self.retriever.retrieve(variant, top_k=self.top_k)
+            for vc in var_candidates:
+                if vc.mesh_id not in existing_ids:
+                    candidates.append(vc)
+                    existing_ids.add(vc.mesh_id)
 
         if abbreviation_expanded:
             # Also retrieve candidates for the expanded form
@@ -424,6 +460,18 @@ class BioLinkerPipeline:
                 if ec.mesh_id not in existing_ids:
                     candidates.append(ec)
                     existing_ids.add(ec.mesh_id)
+
+        # ── Embedding retrieval (hybrid merge + re-scoring) ──
+        if self.embedding_retriever is not None:
+            emb_candidates = self.embedding_retriever.retrieve(mention, top_k=self.top_k)
+            existing_ids = {c.mesh_id for c in candidates}
+            for ec in emb_candidates:
+                if ec.mesh_id not in existing_ids:
+                    candidates.append(ec)
+                    existing_ids.add(ec.mesh_id)
+            # Hybrid re-scoring
+            if self.hybrid_scorer is not None:
+                candidates = self.hybrid_scorer.rescore(mention, candidates)
 
         if not candidates:
             return LinkingResult(
