@@ -374,8 +374,7 @@ class EmbeddingRetriever:
         """
         Compute embedding similarity between a mention and existing candidates.
 
-        For each candidate, encodes its preferred_label (and best synonym)
-        and returns the max cosine similarity to the mention.
+        Encodes each candidate's preferred_label and returns cosine similarity.
 
         Parameters
         ----------
@@ -395,15 +394,12 @@ class EmbeddingRetriever:
         # Encode the mention
         mention_emb = self._encode_batch([mention])  # (1, dim)
 
-        # Collect all labels to score (preferred label per candidate)
-        # We use preferred_label as the representative text
+        # Encode preferred labels
         labels = [c.preferred_label for c in candidates]
-
-        # Encode all labels in one batch for efficiency
         label_embs = self.encode_texts(labels)  # (n, dim)
 
         # Cosine similarity (vectors are already normalized)
-        similarities = np.dot(label_embs, mention_emb.T).flatten()  # (n,)
+        similarities = np.dot(label_embs, mention_emb.T).flatten()
 
         # Map to mesh_id, scaled to 0-100
         scores = {}
@@ -425,6 +421,93 @@ class EmbeddingRetriever:
             "candidates": candidates,
             "query_embedding_norm": float(np.linalg.norm(query_emb)),
         }
+
+
+# ── Multi-Model Retriever ──────────────────────────────────────────────────
+
+class MultiEmbeddingRetriever:
+    """
+    Combines multiple embedding retrievers (e.g., SapBERT + BioLinkBERT).
+
+    Merges candidates from all models, keeping the highest score per mesh_id.
+    For score_candidates(), averages the scores across models.
+
+    Parameters
+    ----------
+    mesh_index : MeSHIndex
+        The built MeSH index.
+    model_names : list[str]
+        List of HuggingFace model names.
+    device : str or None
+        Device for all models.
+    batch_size : int
+        Batch size for encoding.
+    """
+
+    def __init__(
+        self,
+        mesh_index=None,
+        model_names: list[str] | None = None,
+        device: str | None = None,
+        batch_size: int = 256,
+    ):
+        if model_names is None:
+            model_names = [
+                "cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
+                "michiyasunaga/BioLinkBERT-base",
+            ]
+
+        self.retrievers = []
+        for name in model_names:
+            r = EmbeddingRetriever(
+                mesh_index=mesh_index,
+                model_name=name,
+                device=device,
+                batch_size=batch_size,
+            )
+            self.retrievers.append(r)
+
+    def build_or_load(self, base_cache_dir: str, max_synonyms_per_entity: int = 10):
+        """Build or load FAISS index for each model."""
+        for r in self.retrievers:
+            # Each model gets its own cache subdirectory
+            model_slug = r.model_name.replace("/", "_")
+            cache_dir = f"{base_cache_dir}/{model_slug}"
+            r.build_or_load(cache_dir, max_synonyms_per_entity)
+
+    def retrieve(self, mention: str, top_k: int = 10) -> list:
+        """
+        Retrieve candidates from all models, merge by highest score.
+        """
+        from mesh_index import CandidateEntity
+
+        best_by_id = {}  # mesh_id → CandidateEntity (with highest score)
+
+        for r in self.retrievers:
+            candidates = r.retrieve(mention, top_k=top_k)
+            for c in candidates:
+                if c.mesh_id not in best_by_id or c.score > best_by_id[c.mesh_id].score:
+                    best_by_id[c.mesh_id] = c
+
+        merged = sorted(best_by_id.values(), key=lambda c: c.score, reverse=True)
+        return merged[:top_k]
+
+    def score_candidates(self, mention: str, candidates: list) -> dict[str, float]:
+        """
+        Score candidates using all models, return average score per mesh_id.
+        """
+        all_scores = []
+        for r in self.retrievers:
+            scores = r.score_candidates(mention, candidates)
+            all_scores.append(scores)
+
+        # Average across models
+        averaged = {}
+        for c in candidates:
+            model_scores = [s.get(c.mesh_id, 0.0) for s in all_scores]
+            averaged[c.mesh_id] = sum(model_scores) / len(model_scores)
+
+        return averaged
 
 
 # ── Quick demo ──────────────────────────────────────────────────────────────

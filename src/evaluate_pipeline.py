@@ -51,9 +51,10 @@ from umls_relation_expander import UMLSRelationExpander
 from domain_rules import DomainRuleReranker
 from llm_disambiguator import LLMDisambiguator
 from abbreviation_expander import AbbreviationExpander
+from string_normalizer import generate_variants
 
 try:
-    from embedding_retriever import EmbeddingRetriever
+    from embedding_retriever import EmbeddingRetriever, MultiEmbeddingRetriever
     from hybrid_scorer import HybridScorer
     HAS_EMBEDDING = True
 except ImportError:
@@ -179,13 +180,28 @@ def run_evaluation(args):
     emb_retriever = None
     if args.embedding and HAS_EMBEDDING:
         cache_dir = str(PROJECT_ROOT / "src" / "improvements" / "cache" / "faiss")
-        emb_retriever = EmbeddingRetriever(
-            mesh_index=index,
-            model_name=args.embedding_model,
-            batch_size=args.embedding_batch_size,
-        )
-        emb_retriever.build_or_load(cache_dir)
-        print(f"  Embedding retriever: ENABLED ({args.embedding_model})")
+        if args.embedding_multi:
+            # Multi-model: SapBERT + BioLinkBERT
+            models = [
+                "cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
+                "michiyasunaga/BioLinkBERT-base",
+            ]
+            emb_retriever = MultiEmbeddingRetriever(
+                mesh_index=index,
+                model_names=models,
+                batch_size=args.embedding_batch_size,
+            )
+            emb_retriever.build_or_load(cache_dir)
+            print(f"  Embedding retriever: MULTI-MODEL ({', '.join(m.split('/')[-1] for m in models)})")
+        else:
+            # Single model
+            emb_retriever = EmbeddingRetriever(
+                mesh_index=index,
+                model_name=args.embedding_model,
+                batch_size=args.embedding_batch_size,
+            )
+            emb_retriever.build_or_load(cache_dir)
+            print(f"  Embedding retriever: ENABLED ({args.embedding_model})")
         print(f"  Hybrid scoring: alpha={args.hybrid_alpha} "
               f"({args.hybrid_alpha*100:.0f}% string + {(1-args.hybrid_alpha)*100:.0f}% embedding)")
     elif args.embedding and not HAS_EMBEDDING:
@@ -257,7 +273,7 @@ def run_evaluation(args):
     p4_correct = 0
 
     # Accuracy@k tracking
-    K_VALUES = [1, 5, 10, 20]
+    K_VALUES = [1, 5, 10, 20, 30]
     p2_at_k = {k: 0 for k in K_VALUES}   # Phase 2 Accuracy@k
     p2b_at_k = {k: 0 for k in K_VALUES}  # Phase 2+expansion Accuracy@k
     p3_at_k = {k: 0 for k in K_VALUES}   # Phase 2+expansion+Phase 3 Accuracy@k
@@ -311,7 +327,17 @@ def run_evaluation(args):
                 abbrev_expanded_count += 1
 
         # ── Phase 2: Retrieve candidates ──
+        # Search original mention + normalized variants
         candidates = retriever.retrieve(mention, top_k=args.top_k)
+        if not args.no_string_normalization:
+            variants = generate_variants(mention)
+            existing_ids = {c.mesh_id for c in candidates}
+            for variant in variants[1:]:  # skip first (= original)
+                var_candidates = retriever.retrieve(variant, top_k=args.top_k)
+                for vc in var_candidates:
+                    if vc.mesh_id not in existing_ids:
+                        candidates.append(vc)
+                        existing_ids.add(vc.mesh_id)
 
         # If abbreviation was expanded, also retrieve for expanded form and merge
         p2_original_top1 = candidates[0].mesh_id if candidates else "NONE"
@@ -665,14 +691,17 @@ if __name__ == "__main__":
     parser.add_argument("--mrrel", type=str, default=None, help="Path to MRREL.RRF for UMLS bridge expansion")
     parser.add_argument("--expansion-top-k", type=int, default=30, help="Max candidates after expansion (default: 30)")
 
-    # Abbreviation expansion
+    # Improvements
     parser.add_argument("--no-abbreviation-expansion", action="store_true", help="Skip abbreviation expansion")
+    parser.add_argument("--no-string-normalization", action="store_true", help="Skip string normalization variants")
 
     # Embedding retrieval
     parser.add_argument("--embedding", action="store_true", help="Enable embedding-based retrieval (SapBERT + FAISS)")
     parser.add_argument("--embedding-model", default="cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
                         help="HuggingFace model for embedding retrieval")
     parser.add_argument("--embedding-batch-size", type=int, default=256, help="Batch size for encoding")
+    parser.add_argument("--embedding-multi", action="store_true",
+                        help="Use both SapBERT + BioLinkBERT (multi-model ensemble)")
     parser.add_argument("--hybrid-alpha", type=float, default=0.7,
                         help="Hybrid scoring weight: 0=pure embedding, 1=pure string (default: 0.7)")
 

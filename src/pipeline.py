@@ -50,6 +50,7 @@ from umls_relation_expander import UMLSRelationExpander
 from domain_rules import DomainRuleReranker
 from llm_disambiguator import LLMDisambiguator
 from abbreviation_expander import AbbreviationExpander
+from string_normalizer import generate_variants
 
 try:
     from embedding_retriever import EmbeddingRetriever
@@ -437,8 +438,16 @@ class BioLinkerPipeline:
                     abbreviation_expanded = expanded
 
         # ── Phase 2: Candidate Generation ──
-        # Search for the original mention (and expanded form if available)
+        # Search original mention + normalized variants
         candidates = self.retriever.retrieve(mention, top_k=self.top_k)
+        variants = generate_variants(mention)
+        existing_ids = {c.mesh_id for c in candidates}
+        for variant in variants[1:]:  # skip first (= original)
+            var_candidates = self.retriever.retrieve(variant, top_k=self.top_k)
+            for vc in var_candidates:
+                if vc.mesh_id not in existing_ids:
+                    candidates.append(vc)
+                    existing_ids.add(vc.mesh_id)
 
         if abbreviation_expanded:
             # Also retrieve candidates for the expanded form
