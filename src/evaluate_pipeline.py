@@ -46,6 +46,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src" / "improvements"))
 from pubtator_parser import parse_pubtator
 from mesh_index import MeSHIndex
 from candidate_retriever import CandidateRetriever, _build_id_mapping
+from cui_mesh_mapper import CUIToMeSHMapper
 from candidate_expander import CandidateExpander
 from umls_relation_expander import UMLSRelationExpander
 from domain_rules import DomainRuleReranker
@@ -215,14 +216,22 @@ def run_evaluation(args):
     if emb_retriever is not None:
         hybrid_scorer = HybridScorer(emb_retriever, alpha=args.hybrid_alpha)
 
-    # ── Step 5: Load BC5CDR test set ──
+    # ── Step 5: Load dataset ──
     print("\n" + "=" * 60)
-    print("Loading BC5CDR test set...")
+    dataset_name = args.dataset.upper()
+    print(f"Loading {dataset_name} test set...")
     print("=" * 60)
 
-    meta, anns, rels = parse_pubtator(
-        str(PROJECT_ROOT / "Data" / "CDR_Data" / "CDR.Corpus.v010516" / "CDR_TestSet.PubTator.txt")
-    )
+    if args.dataset == "bc5cdr":
+        data_path = str(PROJECT_ROOT / "Data" / "CDR_Data" / "CDR.Corpus.v010516" / "CDR_TestSet.PubTator.txt")
+    elif args.dataset == "biored":
+        data_path = str(PROJECT_ROOT / "Data" / "BioRED" / "Test.PubTator")
+    elif args.dataset == "medmentions":
+        data_path = str(PROJECT_ROOT / "Data" / "MedMention" / "MedMentions_st21pv_pubtator.txt")
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset}")
+
+    meta, anns, rels = parse_pubtator(data_path)
 
     # Build context lookup
     context_lookup = {}
@@ -241,8 +250,49 @@ def run_evaluation(args):
     label_to_ids = id_map.pop("__label_to_ids__", {})
     id_map.pop("__label_lookup__", None)
 
-    # Deduplicate and filter
-    eval_df = anns[anns["mesh_id"] != "-1"].drop_duplicates(subset=["mention", "mesh_id"])
+    # Filter to MeSH-linkable entities only
+    # BioRED: only DiseaseOrPhenotypicFeature + ChemicalEntity have MeSH IDs
+    # MedMentions: uses UMLS IDs (not MeSH) — filter to those mappable to MeSH
+    eval_df = anns.copy()
+
+    if args.dataset == "biored":
+        # Only keep entities with MeSH-like IDs (start with D or C followed by digits)
+        mesh_mask = eval_df["mesh_id"].str.match(r'^[DC]\d+', na=False)
+        skipped = len(eval_df) - mesh_mask.sum()
+        eval_df = eval_df[mesh_mask]
+        print(f"  Filtered to MeSH-linkable entities: {len(eval_df)} (skipped {skipped} non-MeSH)")
+        # Show entity type breakdown
+        print(f"  Entity types: {dict(eval_df['entity_type'].value_counts())}")
+
+    elif args.dataset == "medmentions":
+        # MedMentions uses UMLS CUI format "UMLS:C0010674"
+        # We need to map CUIs → MeSH IDs using MRCONSO.RRF
+        mrconso_path = args.umls or str(PROJECT_ROOT / "Data" / "UMLS" / "MRCONSO.RRF")
+        cui_mapper = CUIToMeSHMapper(mrconso_path)
+        cui_mapper.load()
+
+        # Strip "UMLS:" prefix to get raw CUI
+        eval_df["original_cui"] = eval_df["mesh_id"]
+        eval_df["cui"] = eval_df["mesh_id"].str.replace("UMLS:", "", regex=False)
+
+        # Filter to CUIs that have a MeSH mapping
+        eval_df["has_mesh"] = eval_df["cui"].apply(lambda c: cui_mapper.is_mappable(c))
+        skipped = (~eval_df["has_mesh"]).sum()
+        eval_df = eval_df[eval_df["has_mesh"]].copy()
+
+        # Replace CUI with MeSH ID(s) — take first MeSH ID as primary gold
+        # (store all as pipe-separated for multi-ID matching)
+        def cui_to_mesh_str(cui):
+            mesh_ids = cui_mapper.cui_to_mesh(cui)
+            return "|".join(sorted(mesh_ids)) if mesh_ids else cui
+        eval_df["mesh_id"] = eval_df["cui"].apply(cui_to_mesh_str)
+
+        eval_df = eval_df.drop(columns=["has_mesh"])
+        print(f"  CUI→MeSH mapping: {len(eval_df)} annotations mappable (skipped {skipped} without MeSH)")
+        print(f"  Unique CUIs mapped: {eval_df['cui'].nunique()}")
+
+    # Remove entries with no valid ID and deduplicate
+    eval_df = eval_df[eval_df["mesh_id"] != "-1"].drop_duplicates(subset=["mention", "mesh_id"])
 
     if args.limit:
         eval_df = eval_df.head(args.limit)
@@ -284,6 +334,11 @@ def run_evaluation(args):
     p3_degraded_vs_p2b = 0
     p4_improved_over_p3 = 0
     p4_degraded_vs_p3 = 0
+
+    # Per-entity-type tracking
+    from collections import defaultdict
+    type_total = defaultdict(int)
+    type_p3_correct = defaultdict(int)
 
     # Expansion diagnostics
     expansion_added_candidates = 0  # total new candidates added by expansion
@@ -470,6 +525,12 @@ def run_evaluation(args):
         if p4_hit:
             p4_correct += 1
 
+        # Per-entity-type tracking
+        et_key = entity_type or "Unknown"
+        type_total[et_key] += 1
+        if p3_hit:
+            type_p3_correct[et_key] += 1
+
         if p2b_hit and not p2_hit:
             p2b_improved_over_p2 += 1
         if p2_hit and not p2b_hit:
@@ -522,7 +583,7 @@ def run_evaluation(args):
 
     # ── Results ──
     print("\n" + "=" * 60)
-    print("RESULTS — Full Pipeline Evaluation")
+    print(f"RESULTS — {dataset_name} Pipeline Evaluation")
     print("=" * 60)
 
     p2_acc = p2_correct / total * 100 if total > 0 else 0
@@ -585,7 +646,18 @@ def run_evaluation(args):
               f"({abbrev_expanded_count*100/total:.1f}%)")
         print(f"    Directly improved top-1:       {abbrev_improved_count}")
 
+    # ── Per-entity-type accuracy ──
+    if len(type_total) > 1:
+        print(f"\n{'─' * 60}")
+        print(f"  Accuracy by entity type (Phase 3 @1):")
+        for et in sorted(type_total.keys(), key=lambda x: type_total[x], reverse=True):
+            t = type_total[et]
+            c = type_p3_correct[et]
+            pct = c / t * 100 if t > 0 else 0
+            print(f"    {et:35s}  {pct:5.1f}%  ({c}/{t})")
+
     print(f"\n{'─' * 60}")
+    print(f"  Dataset:                     {dataset_name}")
     expansion_str = "ON" if expander else "OFF"
     print(f"  Candidate expansion:         {expansion_str}")
     if expander:
@@ -676,7 +748,11 @@ def run_evaluation(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Full Pipeline Evaluation on BC5CDR")
+    parser = argparse.ArgumentParser(description="Full Pipeline Evaluation")
+
+    # Dataset selection
+    parser.add_argument("--dataset", choices=["bc5cdr", "biored", "medmentions"],
+                        default="bc5cdr", help="Dataset to evaluate on (default: bc5cdr)")
 
     # Phase 2 settings
     parser.add_argument("--backend", choices=["rapidfuzz", "elasticsearch"], default="rapidfuzz")
