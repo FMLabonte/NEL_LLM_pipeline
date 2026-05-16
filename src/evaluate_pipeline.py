@@ -53,6 +53,7 @@ from domain_rules import DomainRuleReranker
 from llm_disambiguator import LLMDisambiguator
 from abbreviation_expander import AbbreviationExpander
 from string_normalizer import generate_variants
+from document_topic_scorer import DocumentTopicScorer
 
 try:
     from embedding_retriever import EmbeddingRetriever, MultiEmbeddingRetriever
@@ -215,6 +216,18 @@ def run_evaluation(args):
     hybrid_scorer = None
     if emb_retriever is not None:
         hybrid_scorer = HybridScorer(emb_retriever, alpha=args.hybrid_alpha)
+
+    # ── Step 4e: Document Topic Scorer (optional) ──
+    topic_scorer = None
+    if not args.no_topic_scoring:
+        topic_scorer = DocumentTopicScorer(
+            boost=args.topic_boost,
+            penalty=args.topic_penalty,
+            min_signal=args.topic_min_signal,
+        )
+        print(f"  Document topic scoring: ENABLED (boost={args.topic_boost}, penalty={args.topic_penalty})")
+    else:
+        print("  Document topic scoring: DISABLED")
 
     # ── Step 5: Load dataset ──
     print("\n" + "=" * 60)
@@ -472,12 +485,18 @@ def run_evaluation(args):
                 p2b_at_k[k] += 1
 
         # ── Phase 3: Re-rank with domain rules ──
+        doc_text = context_lookup.get(pmid, {}).get("full_text", "")
         reranked = reranker.rerank(
             mention=mention,
             candidates=candidates,
             entity_type=entity_type,
-            context=context_lookup.get(pmid, {}).get("full_text", ""),
+            context=doc_text,
         )
+
+        # ── Document topic consistency (optional, after Phase 3) ──
+        if topic_scorer is not None:
+            topic = topic_scorer.detect_topic(doc_text)
+            reranked = topic_scorer.rescore(reranked, topic)
 
         p3_top1 = reranked[0].mesh_id
         p3_hit = p3_top1 in expanded_gold_ids
@@ -770,6 +789,10 @@ if __name__ == "__main__":
     # Improvements
     parser.add_argument("--no-abbreviation-expansion", action="store_true", help="Skip abbreviation expansion")
     parser.add_argument("--no-string-normalization", action="store_true", help="Skip string normalization variants")
+    parser.add_argument("--no-topic-scoring", action="store_true", help="Skip document topic consistency scoring")
+    parser.add_argument("--topic-boost", type=float, default=3.0, help="Topic match boost (default: 3.0)")
+    parser.add_argument("--topic-penalty", type=float, default=-3.0, help="Topic conflict penalty (default: -3.0)")
+    parser.add_argument("--topic-min-signal", type=int, default=4, help="Min keyword weight to activate topic scoring (default: 4)")
 
     # Embedding retrieval
     parser.add_argument("--embedding", action="store_true", help="Enable embedding-based retrieval (SapBERT + FAISS)")

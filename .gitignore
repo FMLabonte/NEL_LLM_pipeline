@@ -56,3 +56,6 @@ pipeline_evaluation_log.json
 # personal error_analysis tools
 /src/candidate-generation/error_analysis.py
 /src/candidate-generation/deep_diagnosis.py
+
+# visualizations
+visualizations/**
