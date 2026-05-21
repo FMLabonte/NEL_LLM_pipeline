@@ -1,0 +1,1071 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MedLinker — Biomedical Entity Linking</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:        #0d1117;
+    --bg-card:   #161b22;
+    --bg-input:  #0d1117;
+    --border:    #30363d;
+    --text:      #e6edf3;
+    --text-dim:  #8b949e;
+    --green:     #2ea043;
+    --green-l:   #3fb950;
+    --green-bg:  #0f2d1a;
+    --blue:      #58a6ff;
+    --orange:    #d29922;
+    --red:       #f85149;
+    --purple:    #bc8cff;
+    --radius:    8px;
+  }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+    min-height: 100vh;
+  }
+
+  /* ── Header ───────────────────────────────────────────────── */
+  header {
+    background: var(--bg-card);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 32px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .logo { display: flex; align-items: center; gap: 12px; }
+
+  .logo-icon {
+    width: 38px; height: 38px;
+    flex-shrink: 0;
+  }
+
+  .logo h1 { font-size: 20px; font-weight: 600; }
+  .logo h1 span { color: var(--green-l); }
+
+  .header-right { display: flex; align-items: center; gap: 16px; }
+
+  #status-badge {
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 600;
+    border: 1px solid var(--border);
+  }
+  .status-not_loaded { background: #30363d; color: var(--text-dim); }
+  .status-loading    { background: #2d1f00; color: var(--orange); border-color: var(--orange); }
+  .status-ready      { background: var(--green-bg); color: var(--green-l); border-color: var(--green); }
+  .status-error      { background: #2d0f0f; color: var(--red); border-color: var(--red); }
+
+  .btn-init-header {
+    padding: 7px 18px;
+    background: var(--green);
+    color: #fff;
+    border: none;
+    border-radius: var(--radius);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: 0.2s;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .btn-init-header:hover { background: #3fb950; }
+  .btn-init-header:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  /* ── Layout ───────────────────────────────────────────────── */
+  .container {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 24px 32px;
+  }
+
+  /* ── Config panel (collapsible) ───────────────────────────── */
+  .config-panel {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    margin-bottom: 20px;
+    overflow: hidden;
+  }
+
+  .config-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    cursor: pointer;
+    user-select: none;
+    transition: 0.15s;
+  }
+  .config-toggle:hover { background: rgba(46,160,67,0.04); }
+
+  .config-toggle h2 {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-dim);
+    display: flex; align-items: center; gap: 8px;
+  }
+
+  .config-toggle .chevron {
+    color: var(--text-dim);
+    font-size: 12px;
+    transition: transform 0.25s;
+  }
+  .config-toggle .chevron.open { transform: rotate(90deg); }
+
+  .config-body {
+    max-height: 0;
+    overflow: hidden;
+    padding: 0 16px;
+    border-top: 1px solid transparent;
+    transition: max-height 0.35s cubic-bezier(0.4, 0, 0.2, 1),
+                padding 0.35s cubic-bezier(0.4, 0, 0.2, 1),
+                border-color 0.2s;
+  }
+  .config-body.open {
+    max-height: 600px;
+    padding: 0 16px 16px 16px;
+    border-top-color: var(--border);
+  }
+
+  .config-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0 32px;
+  }
+
+  .config-group { padding-top: 12px; }
+
+  .config-group h3 {
+    font-size: 12px;
+    font-weight: 600;
+    margin-bottom: 8px;
+    color: var(--green-l);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .toggle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 0;
+    border-bottom: 1px solid rgba(48,54,61,0.4);
+  }
+
+  .toggle-label { font-size: 13px; cursor: pointer; }
+  .toggle-label small { display: block; color: var(--text-dim); font-size: 11px; margin-top: 1px; }
+
+  .switch {
+    position: relative;
+    width: 36px; height: 20px;
+    flex-shrink: 0;
+    margin-left: 8px;
+  }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider {
+    position: absolute; inset: 0;
+    background: #30363d;
+    border-radius: 20px;
+    cursor: pointer;
+    transition: 0.25s;
+  }
+  .slider::before {
+    content: "";
+    position: absolute;
+    width: 14px; height: 14px;
+    left: 3px; bottom: 3px;
+    background: #fff;
+    border-radius: 50%;
+    transition: 0.25s;
+  }
+  .switch input:checked + .slider { background: var(--green); }
+  .switch input:checked + .slider::before { transform: translateX(16px); }
+
+  .param-row { padding: 6px 0; border-bottom: 1px solid rgba(48,54,61,0.4); }
+  .param-row label {
+    font-size: 13px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 4px;
+  }
+  .param-row label span { color: var(--green-l); font-weight: 600; font-size: 12px; }
+  .param-row input[type="range"] { width: 100%; accent-color: var(--green); height: 4px; }
+
+  /* ── Intro section ─────────────────────────────────────────── */
+  .intro {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px 24px;
+    margin-bottom: 20px;
+    display: flex;
+    gap: 24px;
+    align-items: flex-start;
+  }
+
+  .intro-text { flex: 1; }
+
+  .intro-text p {
+    font-size: 14px;
+    color: var(--text-dim);
+    line-height: 1.65;
+    margin-bottom: 10px;
+  }
+
+  .intro-text p:last-child { margin-bottom: 0; }
+
+  .phase-pills {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin: 12px 0;
+  }
+
+  .phase-pill {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 12px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 600;
+    border: 1px solid var(--border);
+    transition: 0.2s;
+  }
+  .phase-pill:hover { border-color: var(--green); }
+
+  .phase-pill .num {
+    width: 20px; height: 20px;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 11px;
+    color: #fff;
+  }
+
+  .pp1 .num { background: #4472C4; }
+  .pp2 .num { background: #2ea043; }
+  .pp3 .num { background: #d29922; }
+  .pp4 .num { background: #7B2D8B; }
+
+  .paper-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--green-l);
+    font-size: 13px;
+    text-decoration: none;
+    padding: 5px 14px;
+    border: 1px solid var(--green);
+    border-radius: var(--radius);
+    transition: 0.2s;
+    margin-top: 4px;
+  }
+  .paper-link:hover { background: var(--green-bg); }
+
+  .intro-graphic {
+    flex-shrink: 0;
+    width: 180px;
+    opacity: 0.8;
+  }
+
+  @media (max-width: 700px) {
+    .intro { flex-direction: column; }
+    .intro-graphic { display: none; }
+  }
+
+  /* ── Tabs ──────────────────────────────────────────────────── */
+  .main-tabs {
+    display: flex;
+    gap: 0;
+    margin-bottom: -1px;
+    position: relative;
+    z-index: 1;
+  }
+
+  .main-tab-btn {
+    padding: 10px 24px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-bottom: none;
+    color: var(--text-dim);
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    border-radius: var(--radius) var(--radius) 0 0;
+    transition: 0.15s;
+  }
+  .main-tab-btn.active {
+    background: var(--bg-card);
+    color: var(--green-l);
+    border-color: var(--green);
+    border-bottom-color: var(--bg-card);
+  }
+
+  .tab-content-wrapper {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 0 var(--radius) var(--radius) var(--radius);
+    padding: 20px;
+  }
+
+  .tab-pane { display: none; }
+  .tab-pane.active { display: block; }
+
+  /* ── Entity Linking tab ───────────────────────────────────── */
+  .input-sub-tabs { display: flex; gap: 8px; margin-bottom: 12px; }
+  .sub-tab-btn {
+    padding: 5px 14px;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    font-size: 12px;
+    cursor: pointer;
+    border-radius: 4px;
+    transition: 0.15s;
+  }
+  .sub-tab-btn.active { border-color: var(--green); color: var(--green-l); }
+
+  textarea {
+    width: 100%;
+    min-height: 140px;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    padding: 12px;
+    font-family: inherit;
+    font-size: 14px;
+    resize: vertical;
+    line-height: 1.6;
+  }
+  textarea:focus { outline: none; border-color: var(--green); }
+
+  .upload-zone {
+    border: 2px dashed var(--border);
+    border-radius: var(--radius);
+    padding: 40px;
+    text-align: center;
+    cursor: pointer;
+    transition: 0.2s;
+  }
+  .upload-zone:hover, .upload-zone.dragover {
+    border-color: var(--green);
+    background: var(--green-bg);
+  }
+  .upload-zone p { color: var(--text-dim); margin-top: 8px; font-size: 13px; }
+  .upload-zone .icon { font-size: 36px; color: var(--green-l); }
+  #file-input { display: none; }
+
+  .mentions-section { margin-top: 14px; }
+  .mentions-section > label { font-size: 13px; color: var(--text-dim); display: block; margin-bottom: 4px; }
+
+  #mentions-input {
+    width: 100%;
+    min-height: 44px;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    padding: 10px 12px;
+    font-family: inherit;
+    font-size: 14px;
+    resize: vertical;
+  }
+  #mentions-input:focus { outline: none; border-color: var(--green); }
+
+  .mentions-hint { font-size: 11px; color: var(--text-dim); margin-top: 3px; }
+
+  .btn-row { display: flex; gap: 10px; margin-top: 14px; align-items: center; }
+
+  .btn-primary {
+    padding: 9px 24px;
+    background: var(--green);
+    color: #fff;
+    border: none;
+    border-radius: var(--radius);
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: 0.2s;
+    display: flex; align-items: center; gap: 7px;
+  }
+  .btn-primary:hover { background: #3fb950; }
+  .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .btn-secondary {
+    padding: 9px 16px;
+    background: transparent;
+    color: var(--text-dim);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-size: 13px;
+    cursor: pointer;
+    transition: 0.2s;
+  }
+  .btn-secondary:hover { color: var(--text); border-color: var(--text-dim); }
+
+  #elapsed { color: var(--text-dim); font-size: 13px; }
+
+  /* ── Results ──────────────────────────────────────────────── */
+  .results-section { margin-top: 16px; }
+  .results-section h2 {
+    font-size: 15px; font-weight: 600; margin-bottom: 12px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .results-section h2 .count {
+    background: var(--green-bg); color: var(--green-l);
+    padding: 2px 10px; border-radius: 12px; font-size: 12px;
+  }
+
+  .result-card {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    margin-bottom: 8px;
+    overflow: hidden;
+    transition: 0.15s;
+  }
+  .result-card:hover { border-color: rgba(46,160,67,0.4); }
+
+  .result-header {
+    padding: 12px 14px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    cursor: pointer;
+    user-select: none;
+  }
+  .result-mention { font-weight: 600; font-size: 14px; }
+  .result-arrow { display: inline-block; color: var(--green-l); margin: 0 8px; font-size: 13px; }
+  .result-linked { color: var(--green-l); font-weight: 600; font-size: 14px; }
+  .result-id {
+    color: var(--text-dim); font-size: 11px;
+    font-family: "SF Mono", "Fira Code", monospace;
+    background: rgba(110,118,129,0.1);
+    padding: 2px 8px; border-radius: 4px;
+  }
+
+  .result-details { display: none; border-top: 1px solid var(--border); }
+  .result-details.open { display: block; }
+
+  .candidates-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .candidates-table th {
+    text-align: left; padding: 6px 10px; color: var(--text-dim);
+    font-weight: 600; font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.4px; background: var(--bg-card);
+    border-bottom: 1px solid var(--border);
+  }
+  .candidates-table td { padding: 5px 10px; border-bottom: 1px solid rgba(48,54,61,0.2); }
+  .candidates-table tr:hover td { background: rgba(46,160,67,0.04); }
+  .candidates-table tr.is-top td { background: var(--green-bg); font-weight: 600; }
+
+  .score-bar {
+    display: inline-block; height: 5px; background: var(--green);
+    border-radius: 3px; margin-left: 6px; vertical-align: middle; opacity: 0.5;
+  }
+
+  .empty-state { text-align: center; padding: 50px 20px; color: var(--text-dim); }
+  .empty-state .icon { font-size: 44px; margin-bottom: 12px; opacity: 0.25; }
+  .empty-state p { font-size: 14px; max-width: 420px; margin: 0 auto; }
+
+  /* ── Evaluation tab ───────────────────────────────────────── */
+  .eval-form { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+
+  .eval-field label {
+    display: block; font-size: 13px; color: var(--text-dim);
+    margin-bottom: 4px; font-weight: 500;
+  }
+
+  .eval-field select, .eval-field input[type="number"] {
+    width: 100%; padding: 8px 10px;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    font-size: 14px;
+    font-family: inherit;
+  }
+  .eval-field select:focus, .eval-field input:focus { outline: none; border-color: var(--green); }
+
+  .eval-toggles {
+    grid-column: 1 / -1;
+    display: flex; flex-wrap: wrap; gap: 12px; padding-top: 4px;
+  }
+
+  .eval-chip {
+    display: flex; align-items: center; gap: 6px;
+    padding: 5px 12px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    font-size: 12px;
+    cursor: pointer;
+    transition: 0.15s;
+    user-select: none;
+  }
+  .eval-chip.active { border-color: var(--green); color: var(--green-l); }
+  .eval-chip .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #30363d; transition: 0.15s;
+  }
+  .eval-chip.active .dot { background: var(--green-l); }
+
+  .eval-output {
+    margin-top: 16px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px;
+    font-family: "SF Mono", "Fira Code", Menlo, monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    max-height: 500px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--text-dim);
+    display: none;
+  }
+
+  /* ── Spinner ──────────────────────────────────────────────── */
+  .spinner {
+    display: inline-block; width: 14px; height: 14px;
+    border: 2px solid rgba(255,255,255,0.2);
+    border-top-color: var(--green-l);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── Scrollbar ────────────────────────────────────────────── */
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+
+  @media (max-width: 700px) {
+    .config-grid { grid-template-columns: 1fr; }
+    .eval-form { grid-template-columns: 1fr; }
+    .container { padding: 16px; }
+  }
+</style>
+</head>
+
+<body>
+
+<!-- ── Header ──────────────────────────────────────────────── -->
+<header>
+  <div class="logo">
+    <svg class="logo-icon" viewBox="0 0 38 38" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <rect width="38" height="38" rx="8" fill="#2ea043"/>
+      <circle cx="12" cy="14" r="4" fill="#fff" opacity="0.9"/>
+      <circle cx="26" cy="14" r="4" fill="#fff" opacity="0.9"/>
+      <circle cx="19" cy="26" r="4" fill="#fff" opacity="0.9"/>
+      <line x1="15" y1="16" x2="23" y2="16" stroke="#fff" stroke-width="2" opacity="0.5"/>
+      <line x1="13" y1="17.5" x2="17.5" y2="23.5" stroke="#fff" stroke-width="2" opacity="0.5"/>
+      <line x1="25" y1="17.5" x2="20.5" y2="23.5" stroke="#fff" stroke-width="2" opacity="0.5"/>
+    </svg>
+    <h1>Med<span>Linker</span></h1>
+  </div>
+  <div class="header-right">
+    <span id="status-badge" class="status-not_loaded">Not Loaded</span>
+    <button class="btn-init-header" id="btn-init" onclick="initPipeline()">
+      Initialize Pipeline
+    </button>
+  </div>
+</header>
+
+<!-- ── Main ────────────────────────────────────────────────── -->
+<div class="container">
+
+  <!-- Config Panel (collapsed by default) -->
+  <div class="config-panel">
+    <div class="config-toggle" onclick="toggleConfig()">
+      <h2>
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M8 4.754a3.246 3.246 0 1 0 0 6.492 3.246 3.246 0 0 0 0-6.492ZM5.754 8a2.246 2.246 0 1 1 4.492 0 2.246 2.246 0 0 1-4.492 0Z"/><path d="M9.796 1.343c-.527-1.79-3.065-1.79-3.592 0l-.094.319a.873.873 0 0 1-1.255.52l-.292-.16c-1.64-.892-3.433.902-2.54 2.541l.159.292a.873.873 0 0 1-.52 1.255l-.319.094c-1.79.527-1.79 3.065 0 3.592l.319.094a.873.873 0 0 1 .52 1.255l-.16.292c-.892 1.64.902 3.434 2.541 2.54l.292-.159a.873.873 0 0 1 1.255.52l.094.319c.527 1.79 3.065 1.79 3.592 0l.094-.319a.873.873 0 0 1 1.255-.52l.292.16c1.64.893 3.434-.902 2.54-2.541l-.159-.292a.873.873 0 0 1 .52-1.255l.319-.094c1.79-.527 1.79-3.065 0-3.592l-.319-.094a.873.873 0 0 1-.52-1.255l.16-.292c.893-1.64-.902-3.433-2.541-2.54l-.292.159a.873.873 0 0 1-1.255-.52l-.094-.319Zm-2.633.283c.246-.835 1.428-.835 1.674 0l.094.319a1.873 1.873 0 0 0 2.693 1.115l.291-.16c.764-.415 1.6.42 1.184 1.185l-.159.292a1.873 1.873 0 0 0 1.116 2.692l.318.094c.835.246.835 1.428 0 1.674l-.319.094a1.873 1.873 0 0 0-1.115 2.693l.16.291c.415.764-.421 1.6-1.185 1.184l-.291-.159a1.873 1.873 0 0 0-2.693 1.116l-.094.318c-.246.835-1.428.835-1.674 0l-.094-.319a1.873 1.873 0 0 0-2.692-1.115l-.292.16c-.764.415-1.6-.421-1.184-1.185l.159-.291A1.873 1.873 0 0 0 1.945 8.93l-.319-.094c-.835-.246-.835-1.428 0-1.674l.319-.094A1.873 1.873 0 0 0 3.06 4.377l-.16-.292c-.415-.764.42-1.6 1.185-1.184l.292.159a1.873 1.873 0 0 0 2.692-1.116l.094-.318Z"/></svg>
+        Pipeline Configuration
+      </h2>
+      <span class="chevron" id="config-chevron">&#9654;</span>
+    </div>
+    <div class="config-body" id="config-body">
+      <div class="config-grid">
+        <div>
+          <div class="config-group">
+            <h3>Phase 2 — Candidate Generation</h3>
+            <div class="toggle-row">
+              <label class="toggle-label">String Normalization<small>Greek, hyphens, possessives</small></label>
+              <label class="switch"><input type="checkbox" id="cfg-string-norm" checked><span class="slider"></span></label>
+            </div>
+            <div class="toggle-row">
+              <label class="toggle-label">Abbreviation Expansion<small>Parenthetical + dictionary</small></label>
+              <label class="switch"><input type="checkbox" id="cfg-abbreviation" checked><span class="slider"></span></label>
+            </div>
+            <div class="toggle-row">
+              <label class="toggle-label">SapBERT Embeddings<small>FAISS retrieval + hybrid scoring</small></label>
+              <label class="switch"><input type="checkbox" id="cfg-embedding" checked><span class="slider"></span></label>
+            </div>
+            <div class="param-row">
+              <label>Hybrid Alpha <span id="alpha-val">0.70</span></label>
+              <input type="range" id="cfg-alpha" min="0" max="1" step="0.05" value="0.7"
+                     oninput="document.getElementById('alpha-val').textContent=parseFloat(this.value).toFixed(2)">
+            </div>
+            <div class="param-row">
+              <label>Top-K Candidates <span id="topk-val">10</span></label>
+              <input type="range" id="cfg-topk" min="5" max="50" step="5" value="10"
+                     oninput="document.getElementById('topk-val').textContent=this.value">
+            </div>
+          </div>
+        </div>
+        <div>
+          <div class="config-group">
+            <h3>Phase 2b — Expansion</h3>
+            <div class="toggle-row">
+              <label class="toggle-label">UMLS Bridge Expansion<small>PAR/CHD + multi-word + parent</small></label>
+              <label class="switch"><input type="checkbox" id="cfg-expansion" checked><span class="slider"></span></label>
+            </div>
+          </div>
+          <div class="config-group">
+            <h3>Phase 3 — Domain Rules</h3>
+            <div class="toggle-row">
+              <label class="toggle-label">Domain Rule Re-Ranking<small>Semantic type + definition overlap</small></label>
+              <label class="switch"><input type="checkbox" id="cfg-phase3" checked><span class="slider"></span></label>
+            </div>
+            <div class="toggle-row">
+              <label class="toggle-label">Document Topic Scoring<small>Taxonomy consistency</small></label>
+              <label class="switch"><input type="checkbox" id="cfg-topic" checked><span class="slider"></span></label>
+            </div>
+          </div>
+          <div class="config-group">
+            <h3>Phase 4 — LLM</h3>
+            <div class="toggle-row">
+              <label class="toggle-label">LLM Disambiguation<small>Qwen3.5-9b + Chain-of-Thought</small></label>
+              <label class="switch"><input type="checkbox" id="cfg-phase4"><span class="slider"></span></label>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Intro -->
+  <div class="intro">
+    <div class="intro-text">
+      <p>
+        <strong style="color:var(--text)">MedLinker</strong> is a neuro-symbolic pipeline for biomedical entity linking
+        — mapping mentions of diseases, chemicals, and other biomedical concepts in text to their standardized
+        identifiers in the <strong style="color:var(--text)">MeSH</strong> (Medical Subject Headings) ontology.
+      </p>
+      <div class="phase-pills">
+        <div class="phase-pill pp1"><span class="num">1</span> Linguistic Rules — entity extraction from raw text</div>
+        <div class="phase-pill pp2"><span class="num">2</span> Candidate Generation — string &amp; semantic search over MeSH</div>
+        <div class="phase-pill pp3"><span class="num">3</span> Domain Rules — re-ranking with biomedical heuristics</div>
+        <div class="phase-pill pp4"><span class="num">4</span> LLM Disambiguation — final selection via language model</div>
+      </div>
+      <p>
+        Built as a reproduction and extension of
+        <a href="https://link.springer.com/chapter/10.1007/978-981-96-0573-6_19" style="color:var(--blue)" target="_blank">BioLinkerAI (PAKDD 2025)</a>
+        with added SapBERT embeddings, hybrid scoring, abbreviation expansion, and string normalization.
+      </p>
+      <a class="paper-link" href="paper.pdf" target="_blank">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M4.5 0A2.5 2.5 0 0 0 2 2.5v11A2.5 2.5 0 0 0 4.5 16h7A2.5 2.5 0 0 0 14 13.5v-8a.5.5 0 0 0-.146-.354l-5-5A.5.5 0 0 0 8.5 0H4.5Zm4 1.207L12.793 5.5H9.5A.5.5 0 0 1 9 5V1.207ZM4.5 1H8v4a1.5 1.5 0 0 0 1.5 1.5H13v7a1.5 1.5 0 0 1-1.5 1.5h-7A1.5 1.5 0 0 1 3 13.5v-11A1.5 1.5 0 0 1 4.5 1Z"/></svg>
+        Read our Paper (PDF)
+      </a>
+    </div>
+    <svg class="intro-graphic" viewBox="0 0 180 140" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <!-- Simplified pipeline flow graphic -->
+      <rect x="10" y="10" width="50" height="28" rx="6" fill="#4472C4" opacity="0.2" stroke="#4472C4" stroke-width="1.5"/>
+      <text x="35" y="28" text-anchor="middle" fill="#4472C4" font-size="9" font-weight="600">Extract</text>
+      <rect x="70" y="10" width="50" height="28" rx="6" fill="#2ea043" opacity="0.2" stroke="#2ea043" stroke-width="1.5"/>
+      <text x="95" y="28" text-anchor="middle" fill="#3fb950" font-size="9" font-weight="600">Search</text>
+      <rect x="10" y="56" width="50" height="28" rx="6" fill="#d29922" opacity="0.2" stroke="#d29922" stroke-width="1.5"/>
+      <text x="35" y="74" text-anchor="middle" fill="#d29922" font-size="9" font-weight="600">Re-rank</text>
+      <rect x="70" y="56" width="50" height="28" rx="6" fill="#7B2D8B" opacity="0.2" stroke="#7B2D8B" stroke-width="1.5"/>
+      <text x="95" y="74" text-anchor="middle" fill="#bc8cff" font-size="9" font-weight="600">LLM</text>
+      <!-- Arrows -->
+      <path d="M60 24 L70 24" stroke="#8b949e" stroke-width="1.2" marker-end="url(#arr)"/>
+      <path d="M95 38 L95 56" stroke="#8b949e" stroke-width="1.2" marker-end="url(#arr)"/>
+      <path d="M70 70 L60 70" stroke="#8b949e" stroke-width="1.2" marker-end="url(#arr2)"/>
+      <!-- Output -->
+      <rect x="130" y="44" width="40" height="28" rx="6" fill="#0f2d1a" stroke="#2ea043" stroke-width="1.5"/>
+      <text x="150" y="62" text-anchor="middle" fill="#3fb950" font-size="8" font-weight="600">MeSH ID</text>
+      <path d="M120 70 L130 58" stroke="#3fb950" stroke-width="1.2" marker-end="url(#arr3)"/>
+      <!-- Nodes -->
+      <circle cx="35" cy="110" r="6" fill="#2ea043" opacity="0.4"/>
+      <circle cx="55" cy="120" r="4" fill="#2ea043" opacity="0.3"/>
+      <circle cx="75" cy="108" r="5" fill="#2ea043" opacity="0.35"/>
+      <circle cx="95" cy="122" r="4" fill="#2ea043" opacity="0.25"/>
+      <circle cx="115" cy="112" r="5" fill="#2ea043" opacity="0.3"/>
+      <line x1="41" y1="110" x2="51" y2="118" stroke="#2ea043" stroke-width="1" opacity="0.3"/>
+      <line x1="59" y1="118" x2="70" y2="110" stroke="#2ea043" stroke-width="1" opacity="0.3"/>
+      <line x1="80" y1="110" x2="91" y2="120" stroke="#2ea043" stroke-width="1" opacity="0.3"/>
+      <line x1="99" y1="120" x2="110" y2="114" stroke="#2ea043" stroke-width="1" opacity="0.3"/>
+      <defs>
+        <marker id="arr" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6" fill="none" stroke="#8b949e" stroke-width="1"/></marker>
+        <marker id="arr2" markerWidth="6" markerHeight="6" refX="1" refY="3" orient="auto"><path d="M6,0 L0,3 L6,6" fill="none" stroke="#8b949e" stroke-width="1"/></marker>
+        <marker id="arr3" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6" fill="none" stroke="#3fb950" stroke-width="1"/></marker>
+      </defs>
+    </svg>
+  </div>
+
+  <!-- Main Tabs -->
+  <div class="main-tabs">
+    <button class="main-tab-btn active" onclick="switchMainTab('linking', this)">Entity Linking</button>
+    <button class="main-tab-btn" onclick="switchMainTab('evaluate', this)">Evaluation</button>
+  </div>
+
+  <div class="tab-content-wrapper">
+
+    <!-- ── Entity Linking Pane ──────────────────────────────── -->
+    <div class="tab-pane active" id="pane-linking">
+      <div class="input-sub-tabs">
+        <button class="sub-tab-btn active" onclick="switchSubTab('text',this)">Text Input</button>
+        <button class="sub-tab-btn" onclick="switchSubTab('pdf',this)">PDF Upload</button>
+      </div>
+
+      <div id="sub-text">
+        <textarea id="context-input" placeholder="Paste a biomedical abstract or text here..."></textarea>
+      </div>
+      <div id="sub-pdf" style="display:none">
+        <div class="upload-zone" id="upload-zone" onclick="document.getElementById('file-input').click()">
+          <div class="icon">&#128196;</div>
+          <p><strong>Click to upload</strong> or drag & drop a PDF</p>
+        </div>
+        <input type="file" id="file-input" accept=".pdf" onchange="handleFileUpload(event)">
+        <div id="pdf-status" style="display:none; margin-top:10px; font-size:13px;"></div>
+      </div>
+
+      <div class="mentions-section">
+        <label for="mentions-input">Entity Mentions (one per line or comma-separated)</label>
+        <textarea id="mentions-input" rows="2" placeholder="e.g. seizures, famotidine, kidney disease"></textarea>
+        <div class="mentions-hint">The pipeline links each mention to the best MeSH concept using the active configuration.</div>
+      </div>
+
+      <div class="btn-row">
+        <button class="btn-primary" id="btn-link" onclick="runLinking()" disabled>Link Entities</button>
+        <button class="btn-secondary" onclick="loadExample()">Load Example</button>
+        <button class="btn-secondary" onclick="clearAll()">Clear</button>
+        <span id="elapsed"></span>
+      </div>
+
+      <div class="results-section" id="results-section">
+        <div class="empty-state" id="empty-state">
+          <div class="icon">&#128269;</div>
+          <p>Initialize the pipeline, then paste text and enter entity mentions to link them to MeSH concepts.</p>
+        </div>
+        <div id="results-container" style="display:none"></div>
+      </div>
+    </div>
+
+    <!-- ── Evaluation Pane ──────────────────────────────────── -->
+    <div class="tab-pane" id="pane-evaluate">
+      <p style="color:var(--text-dim); font-size:13px; margin-bottom:16px;">
+        Run the full evaluation pipeline on a benchmark dataset. Results are streamed live below.
+        This uses the same <code style="color:var(--green-l)">evaluate_pipeline.py</code> script as the CLI.
+      </p>
+
+      <div class="eval-form">
+        <div class="eval-field">
+          <label>Dataset</label>
+          <select id="eval-dataset">
+            <option value="bc5cdr">BC5CDR (2,625 mentions)</option>
+            <option value="biored">BioRED (MeSH-linkable subset)</option>
+            <option value="medmentions">MedMentions (CUI&#x2192;MeSH mapped)</option>
+          </select>
+        </div>
+        <div class="eval-field">
+          <label>Limit (0 = all)</label>
+          <input type="number" id="eval-limit" value="0" min="0" step="100" placeholder="0 = full dataset">
+        </div>
+
+        <div class="eval-toggles">
+          <div class="eval-chip active" id="echip-embedding" onclick="toggleChip(this)">
+            <span class="dot"></span> SapBERT Embeddings
+          </div>
+          <div class="eval-chip active" id="echip-expansion" onclick="toggleChip(this)">
+            <span class="dot"></span> UMLS Expansion
+          </div>
+          <div class="eval-chip active" id="echip-abbreviation" onclick="toggleChip(this)">
+            <span class="dot"></span> Abbreviation Expansion
+          </div>
+          <div class="eval-chip active" id="echip-string-norm" onclick="toggleChip(this)">
+            <span class="dot"></span> String Normalization
+          </div>
+          <div class="eval-chip active" id="echip-topic" onclick="toggleChip(this)">
+            <span class="dot"></span> Topic Scoring
+          </div>
+        </div>
+      </div>
+
+      <div class="btn-row" style="margin-top:16px">
+        <button class="btn-primary" id="btn-eval" onclick="startEval()">
+          Run Evaluation
+        </button>
+        <button class="btn-secondary" id="btn-eval-stop" onclick="stopEval()" style="display:none">
+          Stop
+        </button>
+        <span id="eval-elapsed" style="color:var(--text-dim); font-size:13px;"></span>
+      </div>
+
+      <pre class="eval-output" id="eval-output"></pre>
+    </div>
+
+  </div>
+</div>
+
+<script>
+let pipelineReady = false;
+
+// ── Config panel ─────────────────────────────────────────────
+function toggleConfig() {
+  const body = document.getElementById('config-body');
+  const chev = document.getElementById('config-chevron');
+  body.classList.toggle('open');
+  chev.classList.toggle('open');
+}
+
+// ── Main tabs ────────────────────────────────────────────────
+function switchMainTab(tab, btn) {
+  document.querySelectorAll('.main-tab-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  document.getElementById('pane-' + tab).classList.add('active');
+}
+
+// ── Sub tabs (text/pdf) ──────────────────────────────────────
+function switchSubTab(tab, btn) {
+  document.querySelectorAll('.sub-tab-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('sub-text').style.display = tab === 'text' ? 'block' : 'none';
+  document.getElementById('sub-pdf').style.display = tab === 'pdf' ? 'block' : 'none';
+}
+
+// ── Pipeline init ────────────────────────────────────────────
+async function initPipeline() {
+  const btn = document.getElementById('btn-init');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Initializing...';
+
+  const config = {
+    use_expansion: document.getElementById('cfg-expansion').checked,
+    use_phase3: document.getElementById('cfg-phase3').checked,
+    use_phase4: document.getElementById('cfg-phase4').checked,
+    use_abbreviation_expansion: document.getElementById('cfg-abbreviation').checked,
+    use_embedding_retrieval: document.getElementById('cfg-embedding').checked,
+    hybrid_alpha: parseFloat(document.getElementById('cfg-alpha').value),
+    top_k: parseInt(document.getElementById('cfg-topk').value),
+  };
+
+  await fetch('/api/init', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config),
+  });
+
+  const poll = setInterval(async () => {
+    const res = await fetch('/api/status');
+    const status = await res.json();
+    updateStatus(status);
+    if (status.state === 'ready') {
+      clearInterval(poll);
+      btn.innerHTML = 'Re-initialize';
+      btn.disabled = false;
+      pipelineReady = true;
+      document.getElementById('btn-link').disabled = false;
+    } else if (status.state === 'error') {
+      clearInterval(poll);
+      btn.innerHTML = 'Initialize Pipeline';
+      btn.disabled = false;
+    }
+  }, 1000);
+}
+
+function updateStatus(status) {
+  const badge = document.getElementById('status-badge');
+  badge.className = 'status-' + status.state;
+  const labels = { not_loaded:'Not Loaded', loading:'Loading...', ready:'Ready', error:'Error' };
+  badge.textContent = labels[status.state] || status.state;
+  badge.title = status.message;
+}
+
+// ── PDF upload ───────────────────────────────────────────────
+const uz = document.getElementById('upload-zone');
+uz.addEventListener('dragover', e => { e.preventDefault(); uz.classList.add('dragover'); });
+uz.addEventListener('dragleave', () => uz.classList.remove('dragover'));
+uz.addEventListener('drop', e => {
+  e.preventDefault(); uz.classList.remove('dragover');
+  if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+});
+function handleFileUpload(e) { if (e.target.files.length) handleFile(e.target.files[0]); }
+
+async function handleFile(file) {
+  const st = document.getElementById('pdf-status');
+  st.style.display = 'block';
+  st.innerHTML = '<span class="spinner"></span> Extracting text...';
+  st.style.color = 'var(--text-dim)';
+  const fd = new FormData(); fd.append('file', file);
+  try {
+    const res = await fetch('/api/extract-pdf', { method:'POST', body:fd });
+    const data = await res.json();
+    if (data.error) { st.innerHTML = data.error; st.style.color = 'var(--red)'; }
+    else {
+      document.getElementById('context-input').value = data.text;
+      document.querySelectorAll('.sub-tab-btn')[0].click();
+      st.innerHTML = 'Extracted ' + data.text.split(/\s+/).length + ' words';
+      st.style.color = 'var(--green-l)';
+    }
+  } catch(e) { st.innerHTML = 'Failed: '+e.message; st.style.color='var(--red)'; }
+}
+
+// ── Entity Linking ───────────────────────────────────────────
+async function runLinking() {
+  if (!pipelineReady) return alert('Initialize the pipeline first.');
+  const mentionsRaw = document.getElementById('mentions-input').value.trim();
+  if (!mentionsRaw) return alert('Enter at least one entity mention.');
+  const mentions = mentionsRaw.split(/[,\n]+/).map(m=>m.trim()).filter(m=>m);
+  const btn = document.getElementById('btn-link');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Linking...';
+  const config = {
+    use_expansion: document.getElementById('cfg-expansion').checked,
+    use_phase3: document.getElementById('cfg-phase3').checked,
+    use_phase4: document.getElementById('cfg-phase4').checked,
+    use_abbreviation_expansion: document.getElementById('cfg-abbreviation').checked,
+  };
+  try {
+    const res = await fetch('/api/link', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ mentions, context: document.getElementById('context-input').value.trim(), config }),
+    });
+    const data = await res.json();
+    if (data.error) alert(data.error); else renderResults(data);
+  } catch(e) { alert('Failed: '+e.message); }
+  finally { btn.disabled=false; btn.innerHTML='Link Entities'; }
+}
+
+function renderResults(data) {
+  document.getElementById('empty-state').style.display='none';
+  const c = document.getElementById('results-container'); c.style.display='block';
+  document.getElementById('elapsed').textContent = data.elapsed+'s';
+  let h = '<h2>Results <span class="count">'+data.count+' linked</span></h2>';
+  data.results.forEach((r,i) => {
+    const id='card-'+i;
+    h += '<div class="result-card"><div class="result-header" onclick="toggle(\''+id+'\')"><div>'
+      + '<span class="result-mention">"'+esc(r.mention)+'"</span>'
+      + '<span class="result-arrow">&#10132;</span>'
+      + '<span class="result-linked">'+esc(r.preferred_label)+'</span></div>'
+      + '<span class="result-id">'+r.mesh_id+'</span></div>'
+      + '<div class="result-details" id="'+id+'"><table class="candidates-table">'
+      + '<thead><tr><th>#</th><th>MeSH ID</th><th>Label</th><th>Score</th><th>Tree</th></tr></thead><tbody>';
+    r.candidates.forEach(ca => {
+      const top = ca.mesh_id===r.mesh_id?' is-top':'';
+      h += '<tr class="'+top+'"><td>'+ca.rank+'</td>'
+        + '<td style="font-family:monospace;font-size:11px">'+ca.mesh_id+'</td>'
+        + '<td>'+esc(ca.label)+'</td>'
+        + '<td>'+ca.score.toFixed(1)+' <span class="score-bar" style="width:'+Math.min(ca.score,100)*0.7+'px"></span></td>'
+        + '<td style="font-size:11px;color:var(--text-dim)">'+(ca.tree_numbers||[]).join(', ')+'</td></tr>';
+    });
+    h += '</tbody></table></div></div>';
+  });
+  c.innerHTML = h;
+}
+
+function toggle(id) { document.getElementById(id).classList.toggle('open'); }
+function esc(s) { const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+
+function loadExample() {
+  document.getElementById('context-input').value =
+    'Famotidine-induced seizures were observed in a 67-year-old patient with chronic kidney disease and type 2 diabetes mellitus. '
+    + 'The patient was also receiving aspirin for cardiovascular protection and metformin for glycemic control. '
+    + 'Hepatotoxicity was ruled out after liver function tests returned normal. '
+    + 'MRI revealed no evidence of Alzheimer\'s disease or other neurodegenerative conditions.';
+  document.getElementById('mentions-input').value =
+    'seizures\nfamotidine\nchronic kidney disease\ntype 2 diabetes mellitus\naspirin\nmetformin\nhepatotoxicity\nAlzheimer\'s disease';
+}
+
+function clearAll() {
+  document.getElementById('context-input').value='';
+  document.getElementById('mentions-input').value='';
+  document.getElementById('results-container').style.display='none';
+  document.getElementById('results-container').innerHTML='';
+  document.getElementById('empty-state').style.display='block';
+  document.getElementById('elapsed').textContent='';
+}
+
+// ── Evaluation ───────────────────────────────────────────────
+function toggleChip(el) { el.classList.toggle('active'); }
+
+let evalPoll = null;
+let evalStartTime = null;
+
+async function startEval() {
+  const btn = document.getElementById('btn-eval');
+  const stop = document.getElementById('btn-eval-stop');
+  const out = document.getElementById('eval-output');
+
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Running...';
+  stop.style.display = 'inline-flex';
+  out.style.display = 'block';
+  out.textContent = 'Starting evaluation...\n';
+  evalStartTime = Date.now();
+
+  const limit = parseInt(document.getElementById('eval-limit').value) || 0;
+  const body = {
+    dataset: document.getElementById('eval-dataset').value,
+    limit: limit > 0 ? limit : null,
+    embedding: document.getElementById('echip-embedding').classList.contains('active'),
+    no_expansion: !document.getElementById('echip-expansion').classList.contains('active'),
+    no_abbreviation: !document.getElementById('echip-abbreviation').classList.contains('active'),
+    no_string_norm: !document.getElementById('echip-string-norm').classList.contains('active'),
+    no_topic_scoring: !document.getElementById('echip-topic').classList.contains('active'),
+    hybrid_alpha: parseFloat(document.getElementById('cfg-alpha').value),
+  };
+
+  await fetch('/api/evaluate', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(body),
+  });
+
+  evalPoll = setInterval(async () => {
+    try {
+      const res = await fetch('/api/evaluate/status');
+      const st = await res.json();
+      out.textContent = st.output || 'Waiting for output...';
+      out.scrollTop = out.scrollHeight;
+
+      const secs = Math.round((Date.now() - evalStartTime) / 1000);
+      document.getElementById('eval-elapsed').textContent = secs + 's elapsed';
+
+      if (st.finished) {
+        clearInterval(evalPoll);
+        btn.disabled = false;
+        btn.innerHTML = 'Run Evaluation';
+        stop.style.display = 'none';
+      }
+    } catch(e) {}
+  }, 1500);
+}
+
+function stopEval() {
+  fetch('/api/evaluate/stop', {method:'POST'});
+  clearInterval(evalPoll);
+  document.getElementById('btn-eval').disabled = false;
+  document.getElementById('btn-eval').innerHTML = 'Run Evaluation';
+  document.getElementById('btn-eval-stop').style.display = 'none';
+}
+
+// ── Init check ───────────────────────────────────────────────
+fetch('/api/status').then(r=>r.json()).then(updateStatus);
+</script>
+</body>
+</html>
