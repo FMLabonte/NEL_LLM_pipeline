@@ -163,6 +163,7 @@ class MeSHIndex:
         enrich_wikidata: bool = False,
         enrich_dbpedia: bool = False,
         enrich_umls: str | None = None,
+        enrich_mondo: bool = False,
     ):
         """
         Parse MeSH XML file(s) and build the search index.
@@ -182,6 +183,10 @@ class MeSHIndex:
         enrich_umls : str or None
             Path to MRCONSO.RRF file. If provided, enriches entities with
             synonyms from all UMLS vocabularies. Cached after first run.
+        enrich_mondo : bool
+            If True, fetch additional disease synonyms from the MONDO
+            ontology. Particularly useful for improving Disease linking.
+            Cached after first download (~90MB).
         """
         if descriptor_path:
             self._parse_descriptors(descriptor_path)
@@ -195,6 +200,8 @@ class MeSHIndex:
             self._enrich_from_wikidata()
         if enrich_dbpedia:
             self._enrich_from_dbpedia()
+        if enrich_mondo:
+            self._enrich_from_mondo()
 
         # Build the appropriate search index based on backend
         if self.backend == "elasticsearch":
@@ -282,6 +289,33 @@ class MeSHIndex:
                     matched_entities += 1
 
         print(f"  UMLS enrichment: added {added_count} new synonyms "
+              f"to {matched_entities} entities")
+
+    def _enrich_from_mondo(self):
+        """
+        Add extra disease synonyms from the MONDO ontology to existing MeSH entities.
+        MONDO unifies OMIM, Orphanet, Disease Ontology, and others — providing
+        extensive synonym coverage especially for diseases.
+        """
+        from mondo_enricher import MONDOEnricher
+
+        enricher = MONDOEnricher()
+        mondo_synonyms = enricher.fetch_mesh_synonyms()
+
+        added_count = 0
+        matched_entities = 0
+
+        for mesh_id, extra_syns in mondo_synonyms.items():
+            if mesh_id in self.entities:
+                entity = self.entities[mesh_id]
+                existing_lower = {s.lower() for s in entity.synonyms}
+                new_syns = [s for s in extra_syns if s.lower() not in existing_lower]
+                if new_syns:
+                    entity.synonyms.extend(new_syns)
+                    added_count += len(new_syns)
+                    matched_entities += 1
+
+        print(f"  MONDO enrichment: added {added_count} new synonyms "
               f"to {matched_entities} entities")
 
     def _parse_descriptors(self, path: str):
@@ -711,6 +745,10 @@ if __name__ == "__main__":
         "--umls", type=str, default=None,
         help="Path to MRCONSO.RRF for UMLS synonym enrichment",
     )
+    parser.add_argument(
+        "--mondo", action="store_true",
+        help="Enrich MeSH entities with MONDO disease ontology synonyms",
+    )
     args = parser.parse_args()
 
     print(f"Using backend: {args.backend}")
@@ -724,6 +762,7 @@ if __name__ == "__main__":
         enrich_wikidata=args.wikidata,
         enrich_dbpedia=args.dbpedia,
         enrich_umls=args.umls,
+        enrich_mondo=args.mondo,
     )
     print(f"Index built in {time.time() - t0:.1f}s\n")
 

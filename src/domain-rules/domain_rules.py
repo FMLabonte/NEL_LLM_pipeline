@@ -269,7 +269,6 @@ class DomainRuleReranker:
             r5 = self._rule5_multi_kg_confidence(c.mesh_id)
             r6 = self._rule6_semantic_type(c, entity_type)
             r7 = self._rule7_definition_overlap(c, mention, context)
-
             adjustment = r5 + r6 + r7
             if protect_top1 and i == 0:
                 adjustment += 15.0
@@ -405,6 +404,7 @@ class DomainRuleReranker:
         boost = min(boost, self.rule7_boost * 3)
 
         return boost
+
 
 
 # ── Quick demo ──────────────────────────────────────────────────────────────

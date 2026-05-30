@@ -46,6 +46,12 @@ sys.path.insert(0, str(PROJECT_ROOT / "src" / "improvements"))
 from pubtator_parser import parse_pubtator
 from mesh_index import MeSHIndex
 from candidate_retriever import CandidateRetriever, _build_id_mapping
+
+try:
+    from umls_index import UMLSIndex
+    HAS_UMLS_INDEX = True
+except ImportError:
+    HAS_UMLS_INDEX = False
 from cui_mesh_mapper import CUIToMeSHMapper
 from candidate_expander import CandidateExpander
 from umls_relation_expander import UMLSRelationExpander
@@ -61,6 +67,12 @@ try:
     HAS_EMBEDDING = True
 except ImportError:
     HAS_EMBEDDING = False
+
+try:
+    from llm_abbreviation_expander import LLMAbbreviationExpander
+    HAS_LLM_ABBREV = True
+except ImportError:
+    HAS_LLM_ABBREV = False
 
 
 def extract_sentence(text: str, mention: str, start: int = -1, window: int = 200) -> str:
@@ -91,19 +103,54 @@ def extract_sentence(text: str, mention: str, start: int = -1, window: int = 200
 def run_evaluation(args):
     """Run full pipeline evaluation."""
 
-    # ── Step 1: Build MeSH index ──
-    print("=" * 60)
-    print(f"Building MeSH index (backend={args.backend})...")
-    print("=" * 60)
+    # ── Step 1: Build search index ──
+    umls_idx = None  # Reference to UMLSIndex if used (for CUI mapping later)
 
-    index = MeSHIndex(backend=args.backend, es_url=args.es_url)
-    index.build_from_xml(
-        descriptor_path=str(PROJECT_ROOT / "Data" / "MeSH" / "desc2026.xml"),
-        supplementary_path=str(PROJECT_ROOT / "Data" / "MeSH" / "supp2026.xml"),
-        enrich_wikidata=args.wikidata,
-        enrich_dbpedia=args.dbpedia,
-        enrich_umls=args.umls,
-    )
+    if args.umls_index:
+        # UMLS index mode: search against full UMLS (broader synonym coverage)
+        if not HAS_UMLS_INDEX:
+            raise ImportError("UMLSIndex not available. Check umls_index.py in candidate-generation/")
+        print("=" * 60)
+        print(f"Building UMLS index...")
+        print("=" * 60)
+
+        mrconso = args.umls or str(PROJECT_ROOT / "Data" / "UMLS" / "MRCONSO.RRF")
+        vocabs = args.umls_vocabs.split(",") if args.umls_vocabs else None
+        umls_idx = UMLSIndex(vocabularies=vocabs)
+        umls_idx.build_from_mrconso(mrconso)
+        umls_idx.print_stats()
+
+        # UMLSIndex has a compatible .search() method returning CandidateEntity
+        # We wrap it in a simple retriever-like object
+        index = umls_idx  # UMLSIndex has .search(query, top_k)
+        retriever = CandidateRetriever(index, top_k=args.top_k)
+
+        # Also build a lightweight MeSH index for Phase 3 domain rules (needs tree numbers)
+        print("\n  Building MeSH index for domain rules (Phase 3)...")
+        mesh_index_for_rules = MeSHIndex(backend=args.backend)
+        mesh_index_for_rules.build_from_xml(
+            descriptor_path=str(PROJECT_ROOT / "Data" / "MeSH" / "desc2026.xml"),
+            supplementary_path=str(PROJECT_ROOT / "Data" / "MeSH" / "supp2026.xml"),
+            enrich_wikidata=False,
+            enrich_dbpedia=False,
+            enrich_umls=None,
+        )
+    else:
+        # Standard MeSH index mode
+        print("=" * 60)
+        print(f"Building MeSH index (backend={args.backend})...")
+        print("=" * 60)
+
+        index = MeSHIndex(backend=args.backend, es_url=args.es_url)
+        index.build_from_xml(
+            descriptor_path=str(PROJECT_ROOT / "Data" / "MeSH" / "desc2026.xml"),
+            supplementary_path=str(PROJECT_ROOT / "Data" / "MeSH" / "supp2026.xml"),
+            enrich_wikidata=args.wikidata,
+            enrich_dbpedia=args.dbpedia,
+            enrich_umls=args.umls,
+            enrich_mondo=args.mondo,
+        )
+        mesh_index_for_rules = index  # same object
 
     retriever = CandidateRetriever(index, top_k=args.top_k)
 
@@ -121,7 +168,7 @@ def run_evaluation(args):
             print("  UMLS bridge: MRREL/MRCONSO not found, skipping UMLS bridge expansion")
 
         expander = CandidateExpander(
-            index, retriever, umls_bridge=umls_bridge,
+            mesh_index_for_rules, retriever, umls_bridge=umls_bridge,
         )
         print("  Candidate expander initialized (UMLS bridge + multi-word + parent injection)")
     else:
@@ -148,7 +195,7 @@ def run_evaluation(args):
 
     # ── Step 3: Create Phase 3 reranker ──
     reranker = DomainRuleReranker(
-        mesh_index=index,
+        mesh_index=mesh_index_for_rules,
         rule5_boost=args.rule5_boost,
         rule6_penalty=args.rule6_penalty,
         rule7_boost=args.rule7_boost,
@@ -178,10 +225,30 @@ def run_evaluation(args):
     else:
         print("  Abbreviation expander: DISABLED")
 
+    # ── Step 4b2: LLM Abbreviation Expander (optional fallback) ──
+    llm_abbrev_expander = None
+    if args.llm_abbreviation and HAS_LLM_ABBREV:
+        try:
+            llm_abbrev_expander = LLMAbbreviationExpander(
+                model=args.llm_abbreviation_model or args.model,
+                base_url=args.base_url,
+                temperature=0.3,
+                debug=args.llm_abbreviation_debug,
+            )
+            print("  LLM abbreviation expander: ENABLED (fallback after rule-based)")
+        except Exception as e:
+            print(f"  LLM abbreviation expander: FAILED ({e})")
+    elif args.llm_abbreviation and not HAS_LLM_ABBREV:
+        print("  LLM abbreviation expander: DISABLED (openai package not installed)")
+    else:
+        print("  LLM abbreviation expander: DISABLED")
+
     # ── Step 4c: Embedding Retriever (optional) ──
     emb_retriever = None
     if args.embedding and HAS_EMBEDDING:
         cache_dir = str(PROJECT_ROOT / "src" / "improvements" / "cache" / "faiss")
+        # Embedding retriever always uses MeSH index (for FAISS label encoding)
+        emb_index = mesh_index_for_rules
         if args.embedding_multi:
             # Multi-model: SapBERT + BioLinkBERT
             models = [
@@ -189,7 +256,7 @@ def run_evaluation(args):
                 "michiyasunaga/BioLinkBERT-base",
             ]
             emb_retriever = MultiEmbeddingRetriever(
-                mesh_index=index,
+                mesh_index=emb_index,
                 model_names=models,
                 batch_size=args.embedding_batch_size,
             )
@@ -198,7 +265,7 @@ def run_evaluation(args):
         else:
             # Single model
             emb_retriever = EmbeddingRetriever(
-                mesh_index=index,
+                mesh_index=emb_index,
                 model_name=args.embedding_model,
                 batch_size=args.embedding_batch_size,
             )
@@ -258,8 +325,8 @@ def run_evaluation(args):
             "full_text": f"{title} {abstract}".strip(),
         }
 
-    # Build ID mapping
-    id_map = _build_id_mapping(index, args.umls)
+    # Build ID mapping (uses MeSH index for version remapping)
+    id_map = _build_id_mapping(mesh_index_for_rules, args.umls)
     label_to_ids = id_map.pop("__label_to_ids__", {})
     id_map.pop("__label_lookup__", None)
 
@@ -279,30 +346,51 @@ def run_evaluation(args):
 
     elif args.dataset == "medmentions":
         # MedMentions uses UMLS CUI format "UMLS:C0010674"
-        # We need to map CUIs → MeSH IDs using MRCONSO.RRF
-        mrconso_path = args.umls or str(PROJECT_ROOT / "Data" / "UMLS" / "MRCONSO.RRF")
-        cui_mapper = CUIToMeSHMapper(mrconso_path)
-        cui_mapper.load()
-
-        # Strip "UMLS:" prefix to get raw CUI
         eval_df["original_cui"] = eval_df["mesh_id"]
         eval_df["cui"] = eval_df["mesh_id"].str.replace("UMLS:", "", regex=False)
 
-        # Filter to CUIs that have a MeSH mapping
-        eval_df["has_mesh"] = eval_df["cui"].apply(lambda c: cui_mapper.is_mappable(c))
-        skipped = (~eval_df["has_mesh"]).sum()
-        eval_df = eval_df[eval_df["has_mesh"]].copy()
+        if args.umls_index and umls_idx is not None:
+            # UMLS index mode: search returns CUIs directly
+            umls_idx.return_cui = True  # ensure search returns CUIs, not MeSH IDs
+            eval_df["mesh_id"] = eval_df["cui"]  # use raw CUI as gold ID
 
-        # Replace CUI with MeSH ID(s) — take first MeSH ID as primary gold
-        # (store all as pipe-separated for multi-ID matching)
-        def cui_to_mesh_str(cui):
-            mesh_ids = cui_mapper.cui_to_mesh(cui)
-            return "|".join(sorted(mesh_ids)) if mesh_ids else cui
-        eval_df["mesh_id"] = eval_df["cui"].apply(cui_to_mesh_str)
+            if args.fair_comparison:
+                # Fair comparison mode: only keep CUIs that have a MeSH mapping
+                # (same subset as MeSH index path, for apples-to-apples comparison)
+                mrconso_path = args.umls or str(PROJECT_ROOT / "Data" / "UMLS" / "MRCONSO.RRF")
+                cui_mapper = CUIToMeSHMapper(mrconso_path)
+                cui_mapper.load()
+                eval_df["has_mesh"] = eval_df["cui"].apply(lambda c: cui_mapper.is_mappable(c))
+                skipped = (~eval_df["has_mesh"]).sum()
+                eval_df = eval_df[eval_df["has_mesh"]].copy()
+                eval_df = eval_df.drop(columns=["has_mesh"])
+                print(f"  UMLS index (FAIR COMPARISON): {len(eval_df)} annotations with MeSH mapping "
+                      f"(skipped {skipped} without MeSH)")
+                print(f"  Unique CUIs: {eval_df['cui'].nunique()}")
+            else:
+                print(f"  UMLS index mode: evaluating ALL {len(eval_df)} annotations (no CUI→MeSH filtering)")
+                print(f"  Unique CUIs: {eval_df['cui'].nunique()}")
+        else:
+            # MeSH index mode: need CUI→MeSH mapping (only 63% of annotations)
+            mrconso_path = args.umls or str(PROJECT_ROOT / "Data" / "UMLS" / "MRCONSO.RRF")
+            cui_mapper = CUIToMeSHMapper(mrconso_path)
+            cui_mapper.load()
 
-        eval_df = eval_df.drop(columns=["has_mesh"])
-        print(f"  CUI→MeSH mapping: {len(eval_df)} annotations mappable (skipped {skipped} without MeSH)")
-        print(f"  Unique CUIs mapped: {eval_df['cui'].nunique()}")
+            # Filter to CUIs that have a MeSH mapping
+            eval_df["has_mesh"] = eval_df["cui"].apply(lambda c: cui_mapper.is_mappable(c))
+            skipped = (~eval_df["has_mesh"]).sum()
+            eval_df = eval_df[eval_df["has_mesh"]].copy()
+
+            # Replace CUI with MeSH ID(s) — take first MeSH ID as primary gold
+            # (store all as pipe-separated for multi-ID matching)
+            def cui_to_mesh_str(cui):
+                mesh_ids = cui_mapper.cui_to_mesh(cui)
+                return "|".join(sorted(mesh_ids)) if mesh_ids else cui
+            eval_df["mesh_id"] = eval_df["cui"].apply(cui_to_mesh_str)
+
+            eval_df = eval_df.drop(columns=["has_mesh"])
+            print(f"  CUI→MeSH mapping: {len(eval_df)} annotations mappable (skipped {skipped} without MeSH)")
+            print(f"  Unique CUIs mapped: {eval_df['cui'].nunique()}")
 
     # Remove entries with no valid ID and deduplicate
     eval_df = eval_df[eval_df["mesh_id"] != "-1"].drop_duplicates(subset=["mention", "mesh_id"])
@@ -317,7 +405,10 @@ def run_evaluation(args):
     print("\n" + "=" * 60)
     phases_label = ""
     if abbrev_expander:
-        phases_label += "Abbrev → "
+        if llm_abbrev_expander:
+            phases_label += "Abbrev(+LLM) → "
+        else:
+            phases_label += "Abbrev → "
     phases_label += "Phase 2"
     if expander:
         phases_label += " → 2b"
@@ -359,8 +450,12 @@ def run_evaluation(args):
     expansion_mentions_affected = 0 # how many mentions got new candidates
 
     # Abbreviation expansion diagnostics
-    abbrev_expanded_count = 0     # how many mentions were expanded
+    abbrev_expanded_count = 0     # how many mentions were expanded (rule-based)
     abbrev_improved_count = 0     # how many went from wrong to correct thanks to expansion
+
+    # LLM abbreviation expansion diagnostics
+    llm_abbrev_expanded_count = 0   # how many mentions were expanded by LLM
+    llm_abbrev_improved_count = 0   # how many went from wrong to correct thanks to LLM expansion
 
     llm_calls = 0
     llm_fallbacks = 0
@@ -383,6 +478,7 @@ def run_evaluation(args):
 
         # ── Pre-Phase 2: Abbreviation Expansion ──
         abbreviation_expanded = None
+        abbreviation_source = None  # "rule" or "llm"
         if abbrev_expander is not None:
             ctx = context_lookup.get(pmid, {})
             full_text = ctx.get("full_text", "")
@@ -392,7 +488,35 @@ def run_evaluation(args):
             )
             if expanded:
                 abbreviation_expanded = expanded
+                abbreviation_source = "rule"
                 abbrev_expanded_count += 1
+
+        # LLM abbreviation expansion fallback: if rule-based didn't find
+        # anything and the mention looks like an abbreviation, ask the LLM
+        if abbreviation_expanded is None and llm_abbrev_expander is not None:
+            # Only try if it looks like an abbreviation (short, uppercase-heavy)
+            # Use the rule-based expander's check if available, otherwise
+            # use a simple heuristic: short text with >50% uppercase
+            is_abbrev = False
+            if abbrev_expander is not None:
+                is_abbrev = abbrev_expander._is_likely_abbreviation(mention)
+            else:
+                # Standalone check: 2-10 chars, >50% uppercase
+                m = mention.strip()
+                if 2 <= len(m) <= 10:
+                    is_abbrev = sum(1 for c in m if c.isupper()) / len(m) >= 0.5
+
+            if is_abbrev:
+                ctx = context_lookup.get(pmid, {})
+                llm_expanded = llm_abbrev_expander.expand(
+                    mention,
+                    context=ctx.get("full_text", ""),
+                    title=ctx.get("title", ""),
+                )
+                if llm_expanded:
+                    abbreviation_expanded = llm_expanded
+                    abbreviation_source = "llm"
+                    llm_abbrev_expanded_count += 1
 
         # ── Phase 2: Retrieve candidates ──
         # Search original mention + normalized variants
@@ -424,7 +548,10 @@ def run_evaluation(args):
                 candidates = sorted(by_id.values(), key=lambda c: c.score, reverse=True)
                 # Track if expansion changed top-1
                 if candidates[0].mesh_id in expanded_gold_ids and p2_original_top1 not in expanded_gold_ids:
-                    abbrev_improved_count += 1
+                    if abbreviation_source == "llm":
+                        llm_abbrev_improved_count += 1
+                    else:
+                        abbrev_improved_count += 1
 
         # ── Embedding retrieval (hybrid merge + re-scoring) ──
         if emb_retriever is not None:
@@ -661,9 +788,14 @@ def run_evaluation(args):
     if abbrev_expander is not None:
         print(f"\n{'─' * 60}")
         print(f"  Abbreviation expansion diagnostics:")
-        print(f"    Mentions expanded:             {abbrev_expanded_count}/{total} "
+        print(f"    Mentions expanded (rule-based): {abbrev_expanded_count}/{total} "
               f"({abbrev_expanded_count*100/total:.1f}%)")
-        print(f"    Directly improved top-1:       {abbrev_improved_count}")
+        print(f"    Directly improved top-1:        {abbrev_improved_count}")
+        if llm_abbrev_expander is not None:
+            print(f"    Mentions expanded (LLM):        {llm_abbrev_expanded_count}/{total} "
+                  f"({llm_abbrev_expanded_count*100/total:.1f}%)")
+            print(f"    LLM directly improved top-1:    {llm_abbrev_improved_count}")
+            llm_abbrev_expander.print_stats()
 
     # ── Per-entity-type accuracy ──
     if len(type_total) > 1:
@@ -682,6 +814,8 @@ def run_evaluation(args):
     if expander:
         print(f"  Expansion top_k:             {args.expansion_top_k}")
     abbrev_str = "ON" if abbrev_expander else "OFF"
+    if llm_abbrev_expander is not None:
+        abbrev_str += " + LLM fallback"
     print(f"  Abbreviation expansion:      {abbrev_str}")
     emb_str = f"ON ({args.embedding_model})" if emb_retriever else "OFF"
     print(f"  Embedding retrieval:         {emb_str}")
@@ -779,7 +913,19 @@ if __name__ == "__main__":
     parser.add_argument("--top-k", type=int, default=10, help="Phase 2 candidates")
     parser.add_argument("--wikidata", action="store_true", help="Wikidata enrichment")
     parser.add_argument("--dbpedia", action="store_true", help="DBpedia enrichment")
+    parser.add_argument("--mondo", action="store_true", help="MONDO disease ontology enrichment (improves Disease linking)")
     parser.add_argument("--umls", type=str, default=None, help="Path to MRCONSO.RRF")
+
+    # UMLS index (alternative to MeSH index)
+    parser.add_argument("--umls-index", action="store_true",
+                        help="Use UMLS index instead of MeSH index (broader synonym coverage, "
+                             "direct CUI matching for MedMentions)")
+    parser.add_argument("--umls-vocabs", type=str, default=None,
+                        help="Comma-separated UMLS vocabularies to include "
+                             "(default: MSH,SNOMEDCT_US,NCI,CHV,MTH,OMIM,HPO,RXNORM). Use 'ALL' for everything.")
+    parser.add_argument("--fair-comparison", action="store_true",
+                        help="When using UMLS index on MedMentions: only evaluate CUIs that "
+                             "have a MeSH mapping (same subset as MeSH index). Enables fair comparison.")
 
     # Phase 2b: Expansion settings
     parser.add_argument("--no-expansion", action="store_true", help="Skip candidate expansion (UMLS bridge, multi-word, parent)")
@@ -788,6 +934,13 @@ if __name__ == "__main__":
 
     # Improvements
     parser.add_argument("--no-abbreviation-expansion", action="store_true", help="Skip abbreviation expansion")
+    parser.add_argument("--llm-abbreviation", action="store_true",
+                        help="Enable LLM-based abbreviation expansion as fallback "
+                             "when rule-based expansion fails")
+    parser.add_argument("--llm-abbreviation-model", type=str, default=None,
+                        help="Model for LLM abbreviation expansion (default: same as --model)")
+    parser.add_argument("--llm-abbreviation-debug", action="store_true",
+                        help="Show first 5 raw LLM responses for abbreviation expansion debugging")
     parser.add_argument("--no-string-normalization", action="store_true", help="Skip string normalization variants")
     parser.add_argument("--no-topic-scoring", action="store_true", help="Skip document topic consistency scoring")
     parser.add_argument("--topic-boost", type=float, default=3.0, help="Topic match boost (default: 3.0)")

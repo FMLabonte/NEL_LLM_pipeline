@@ -64,6 +64,8 @@ class HybridScorer:
         if not candidates:
             return candidates
 
+        alpha = self.alpha
+
         # Get embedding similarity for all candidates
         emb_scores = self.embedding_retriever.score_candidates(mention, candidates)
 
@@ -72,7 +74,7 @@ class HybridScorer:
             string_score = c.score  # rapidfuzz score (0-100)
             embedding_score = emb_scores.get(c.mesh_id, 0.0)  # embedding score (0-100)
 
-            c.score = self.alpha * string_score + (1 - self.alpha) * embedding_score
+            c.score = alpha * string_score + (1 - alpha) * embedding_score
 
         # Sort by hybrid score (descending)
         candidates.sort(key=lambda c: c.score, reverse=True)

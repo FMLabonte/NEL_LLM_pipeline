@@ -45,6 +45,12 @@ sys.path.insert(0, str(PROJECT_ROOT / "src" / "improvements"))
 
 from mesh_index import MeSHIndex
 from candidate_retriever import CandidateRetriever
+
+try:
+    from umls_index import UMLSIndex
+    HAS_UMLS_INDEX = True
+except ImportError:
+    HAS_UMLS_INDEX = False
 from candidate_expander import CandidateExpander
 from umls_relation_expander import UMLSRelationExpander
 from domain_rules import DomainRuleReranker
@@ -170,6 +176,9 @@ class BioLinkerPipeline:
         use_embedding_retrieval: bool = False,
         embedding_model: str = "cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
         hybrid_alpha: float = 0.7,
+        use_umls_index: bool = False,
+        umls_mrconso: str | None = None,
+        umls_vocabs: list[str] | None = None,
     ):
         self.top_k = top_k
         self.llm_top_k = llm_top_k
@@ -177,6 +186,7 @@ class BioLinkerPipeline:
         self.use_phase3 = use_phase3
         self.use_phase4 = use_phase4
         self.use_abbreviation_expansion = use_abbreviation_expansion
+        self.use_umls_index = use_umls_index
 
         # ── Improvement: Abbreviation Expander ──
         self.abbreviation_expander = AbbreviationExpander() if use_abbreviation_expansion else None
@@ -189,18 +199,40 @@ class BioLinkerPipeline:
         # ── Phase 1: Linguistic Entity Extractor (lazy init) ──
         self._extractor = None
 
-        # ── Phase 2: MeSH Index + Candidate Retriever ──
-        self.index = MeSHIndex(backend=backend, es_url=es_url)
-        if mesh_xml:
-            self.index.build_from_xml(
-                descriptor_path=mesh_xml,
-                supplementary_path=supp_xml or str(
-                    Path(mesh_xml).parent / "supp2026.xml"
-                ),
-                enrich_wikidata=enrich_wikidata,
-                enrich_dbpedia=enrich_dbpedia,
-                enrich_umls=enrich_umls,
-            )
+        # ── Phase 2: Search Index + Candidate Retriever ──
+        if use_umls_index and HAS_UMLS_INDEX:
+            # UMLS index mode: broader synonym coverage
+            mrconso = umls_mrconso or str(PROJECT_ROOT / "Data" / "UMLS" / "MRCONSO.RRF")
+            self.umls_idx = UMLSIndex(vocabularies=umls_vocabs)
+            self.umls_idx.build_from_mrconso(mrconso)
+            self.index = self.umls_idx
+            # Also build MeSH index for domain rules (needs tree numbers)
+            self.mesh_index = MeSHIndex(backend=backend, es_url=es_url)
+            if mesh_xml:
+                self.mesh_index.build_from_xml(
+                    descriptor_path=mesh_xml,
+                    supplementary_path=supp_xml or str(
+                        Path(mesh_xml).parent / "supp2026.xml"
+                    ),
+                    enrich_wikidata=False,
+                    enrich_dbpedia=False,
+                    enrich_umls=None,
+                )
+        else:
+            self.umls_idx = None
+            self.index = MeSHIndex(backend=backend, es_url=es_url)
+            if mesh_xml:
+                self.index.build_from_xml(
+                    descriptor_path=mesh_xml,
+                    supplementary_path=supp_xml or str(
+                        Path(mesh_xml).parent / "supp2026.xml"
+                    ),
+                    enrich_wikidata=enrich_wikidata,
+                    enrich_dbpedia=enrich_dbpedia,
+                    enrich_umls=enrich_umls,
+                )
+            self.mesh_index = self.index  # same object
+
         self.retriever = CandidateRetriever(self.index, top_k=top_k)
 
         # ── Embedding Retriever (optional) ──
@@ -231,7 +263,7 @@ class BioLinkerPipeline:
         # ── Phase 3: Domain Rule Reranker ──
         wikidata, dbpedia, umls = self._load_enrichment_caches()
         self.reranker = DomainRuleReranker(
-            mesh_index=self.index,
+            mesh_index=self.mesh_index,
             rule5_boost=rule5_boost,
             rule6_penalty=rule6_penalty,
             rule7_boost=rule7_boost,
