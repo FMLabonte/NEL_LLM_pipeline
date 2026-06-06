@@ -74,6 +74,24 @@ try:
 except ImportError:
     HAS_LLM_ABBREV = False
 
+try:
+    from sentence_context_scorer import SentenceContextScorer
+    HAS_SENTENCE_CONTEXT = True
+except ImportError:
+    HAS_SENTENCE_CONTEXT = False
+
+try:
+    from mini_disease_disambiguator import MiniDiseaseDisambiguator
+    HAS_MINI_DISAMBIG = True
+except ImportError:
+    HAS_MINI_DISAMBIG = False
+
+try:
+    from learned_ranker import LearnedRanker, extract_features_for_mention
+    HAS_LEARNED_RANKER = True
+except Exception:
+    HAS_LEARNED_RANKER = False
+
 
 def extract_sentence(text: str, mention: str, start: int = -1, window: int = 200) -> str:
     """Extract a sentence-level context window around the mention."""
@@ -296,14 +314,71 @@ def run_evaluation(args):
     else:
         print("  Document topic scoring: DISABLED")
 
+    # ── Step 4f: Sentence-Context Scorer (optional, Disease-focused) ──
+    sentence_scorer = None
+    if args.sentence_context and emb_retriever is not None and HAS_SENTENCE_CONTEXT:
+        sentence_scorer = SentenceContextScorer(
+            embedding_retriever=emb_retriever,
+            weight=args.sentence_context_weight,
+            ambiguity_threshold=args.sentence_context_threshold,
+            disease_only=True,
+        )
+        print(f"  Sentence-context scoring: ENABLED (weight={args.sentence_context_weight}, "
+              f"threshold={args.sentence_context_threshold}, Disease-only)")
+    elif args.sentence_context and emb_retriever is None:
+        print("  Sentence-context scoring: DISABLED (requires --embedding)")
+    elif args.sentence_context and not HAS_SENTENCE_CONTEXT:
+        print("  Sentence-context scoring: DISABLED (module not found)")
+    else:
+        print("  Sentence-context scoring: DISABLED")
+
+    # ── Step 4g: Mini Disease Disambiguator (optional, Disease-focused) ──
+    mini_disambig = None
+    if args.mini_disambig and HAS_MINI_DISAMBIG:
+        try:
+            mini_disambig = MiniDiseaseDisambiguator(
+                model=args.mini_disambig_model or args.model,
+                base_url=args.base_url,
+                ambiguity_threshold=args.mini_disambig_threshold,
+                max_candidates=args.mini_disambig_max_candidates,
+                debug=args.mini_disambig_debug,
+            )
+            print(f"  Mini Disease Disambiguator: ENABLED "
+                  f"(threshold={args.mini_disambig_threshold}, "
+                  f"max_candidates={args.mini_disambig_max_candidates})")
+        except Exception as e:
+            print(f"  Mini Disease Disambiguator: FAILED ({e})")
+    elif args.mini_disambig and not HAS_MINI_DISAMBIG:
+        print("  Mini Disease Disambiguator: DISABLED (module not found)")
+    else:
+        print("  Mini Disease Disambiguator: DISABLED")
+
+    # ── Step 4h: Learned Ranker (optional, XGBoost) ──
+    learned_ranker = None
+    if args.learned_ranker and HAS_LEARNED_RANKER:
+        try:
+            learned_ranker = LearnedRanker(model_path=args.learned_ranker)
+            print(f"  Learned ranker: ENABLED (loaded from {args.learned_ranker})")
+        except Exception as e:
+            print(f"  Learned ranker: FAILED ({e})")
+    elif args.train_ranker and HAS_LEARNED_RANKER:
+        print(f"  Learned ranker: TRAINING MODE (will train after evaluation)")
+    elif (args.learned_ranker or args.train_ranker) and not HAS_LEARNED_RANKER:
+        print("  Learned ranker: DISABLED (xgboost not installed)")
+    else:
+        print("  Learned ranker: DISABLED")
+
     # ── Step 5: Load dataset ──
     print("\n" + "=" * 60)
     dataset_name = args.dataset.upper()
-    print(f"Loading {dataset_name} test set...")
+    split_label = args.split.upper() if hasattr(args, 'split') else "TEST"
+    print(f"Loading {dataset_name} {split_label} set...")
     print("=" * 60)
 
     if args.dataset == "bc5cdr":
-        data_path = str(PROJECT_ROOT / "Data" / "CDR_Data" / "CDR.Corpus.v010516" / "CDR_TestSet.PubTator.txt")
+        split_map = {"train": "TrainingSet", "dev": "DevelopmentSet", "test": "TestSet"}
+        split_name = split_map.get(args.split, "TestSet")
+        data_path = str(PROJECT_ROOT / "Data" / "CDR_Data" / "CDR.Corpus.v010516" / f"CDR_{split_name}.PubTator.txt")
     elif args.dataset == "biored":
         data_path = str(PROJECT_ROOT / "Data" / "BioRED" / "Test.PubTator")
     elif args.dataset == "medmentions":
@@ -459,6 +534,10 @@ def run_evaluation(args):
 
     llm_calls = 0
     llm_fallbacks = 0
+
+    # Learned ranker training data collection
+    ranker_train_features = []  # list of list[dict] per mention
+    ranker_train_labels = []    # list of list[int] per mention
 
     changes_log = []
     t0 = time.time()
@@ -624,6 +703,47 @@ def run_evaluation(args):
         if topic_scorer is not None:
             topic = topic_scorer.detect_topic(doc_text)
             reranked = topic_scorer.rescore(reranked, topic)
+
+        # ── Sentence-context scoring (optional, Disease-focused) ──
+        if sentence_scorer is not None:
+            sentence = extract_sentence(doc_text, mention)
+            reranked = sentence_scorer.rescore(
+                mention=mention,
+                candidates=reranked,
+                sentence=sentence,
+                entity_type=entity_type,
+            )
+
+        # ── Mini Disease Disambiguator (optional, Disease-focused) ──
+        if mini_disambig is not None:
+            sentence = extract_sentence(doc_text, mention)
+            reranked = mini_disambig.disambiguate_if_ambiguous(
+                mention=mention,
+                candidates=reranked,
+                sentence=sentence,
+                entity_type=entity_type,
+            )
+
+        # ── Learned Ranker: re-rank with XGBoost (optional) ──
+        if learned_ranker is not None:
+            reranked = learned_ranker.rerank(
+                mention=mention,
+                candidates=reranked,
+                entity_type=entity_type,
+                context=doc_text,
+            )
+
+        # ── Learned Ranker: collect training data (optional) ──
+        if args.train_ranker and HAS_LEARNED_RANKER:
+            feats = extract_features_for_mention(
+                mention, reranked, entity_type, doc_text,
+            )
+            labels = [
+                1 if c.mesh_id in expanded_gold_ids else 0
+                for c in reranked
+            ]
+            ranker_train_features.append(feats)
+            ranker_train_labels.append(labels)
 
         p3_top1 = reranked[0].mesh_id
         p3_hit = p3_top1 in expanded_gold_ids
@@ -797,6 +917,11 @@ def run_evaluation(args):
             print(f"    LLM directly improved top-1:    {llm_abbrev_improved_count}")
             llm_abbrev_expander.print_stats()
 
+    # ── Mini Disease Disambiguator diagnostics ──
+    if mini_disambig is not None:
+        print(f"\n{'─' * 60}")
+        mini_disambig.print_stats()
+
     # ── Per-entity-type accuracy ──
     if len(type_total) > 1:
         print(f"\n{'─' * 60}")
@@ -873,6 +998,28 @@ def run_evaluation(args):
                     print(f'  "{r["mention"]}" [{r["entity_type"]}] gold={r["gold_id"]}')
                     print(f"    P3: {r['p3_top1']} (correct) → P4: {r['p4_top1']} (wrong)")
 
+    # ── Train learned ranker if requested ──
+    if args.train_ranker and HAS_LEARNED_RANKER and ranker_train_features:
+        print(f"\n{'═' * 60}")
+        print("TRAINING LEARNED RANKER (XGBoost)")
+        print(f"{'═' * 60}")
+
+        ranker = LearnedRanker()
+        ranker.train(
+            all_features=ranker_train_features,
+            all_labels=ranker_train_labels,
+            n_estimators=args.ranker_n_estimators,
+            max_depth=args.ranker_max_depth,
+            learning_rate=args.ranker_lr,
+        )
+
+        model_path = str(
+            PROJECT_ROOT / "src" / "improvements" / "cache" / "ranker_model.pkl"
+        )
+        ranker.save(model_path)
+        print(f"\n  To use this model for evaluation, run:")
+        print(f"    python3 src/evaluate_pipeline.py --learned-ranker {model_path} ...")
+
     # ── Save detailed log ──
     log_path = PROJECT_ROOT / "src" / "pipeline_evaluation_log.json"
     with open(log_path, "w") as f:
@@ -906,6 +1053,8 @@ if __name__ == "__main__":
     # Dataset selection
     parser.add_argument("--dataset", choices=["bc5cdr", "biored", "medmentions"],
                         default="bc5cdr", help="Dataset to evaluate on (default: bc5cdr)")
+    parser.add_argument("--split", choices=["train", "dev", "test"],
+                        default="test", help="Data split to use (default: test)")
 
     # Phase 2 settings
     parser.add_argument("--backend", choices=["rapidfuzz", "elasticsearch"], default="rapidfuzz")
@@ -934,6 +1083,24 @@ if __name__ == "__main__":
 
     # Improvements
     parser.add_argument("--no-abbreviation-expansion", action="store_true", help="Skip abbreviation expansion")
+    parser.add_argument("--sentence-context", action="store_true",
+                        help="Enable sentence-context re-ranking for Disease entities "
+                             "(requires --embedding)")
+    parser.add_argument("--sentence-context-weight", type=float, default=5.0,
+                        help="Weight for sentence-context similarity boost (default: 5.0)")
+    parser.add_argument("--sentence-context-threshold", type=float, default=15.0,
+                        help="Only apply sentence-context when top-1 vs top-2 gap < threshold (default: 15.0)")
+    parser.add_argument("--mini-disambig", action="store_true",
+                        help="Enable Mini Disease Disambiguator (lightweight LLM for "
+                             "ambiguous Disease mentions)")
+    parser.add_argument("--mini-disambig-model", type=str, default=None,
+                        help="Model for Mini Disease Disambiguator (default: same as --model)")
+    parser.add_argument("--mini-disambig-threshold", type=float, default=10.0,
+                        help="Score gap threshold to trigger LLM disambiguation (default: 10.0)")
+    parser.add_argument("--mini-disambig-max-candidates", type=int, default=3,
+                        help="Max candidates to show the LLM (default: 3)")
+    parser.add_argument("--mini-disambig-debug", action="store_true",
+                        help="Show debug info for Mini Disease Disambiguator")
     parser.add_argument("--llm-abbreviation", action="store_true",
                         help="Enable LLM-based abbreviation expansion as fallback "
                              "when rule-based expansion fails")
@@ -968,6 +1135,18 @@ if __name__ == "__main__":
     parser.add_argument("--base-url", default="http://localhost:1234/v1", help="LLM API URL")
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--llm-top-k", type=int, default=10, help="Candidates to pass to LLM")
+
+    # Learned Ranker (XGBoost)
+    parser.add_argument("--train-ranker", action="store_true",
+                        help="Train XGBoost ranker on current data split and save model")
+    parser.add_argument("--learned-ranker", type=str, default=None,
+                        help="Path to trained XGBoost ranker model (re-ranks after Phase 3)")
+    parser.add_argument("--ranker-n-estimators", type=int, default=300,
+                        help="XGBoost n_estimators (default: 300)")
+    parser.add_argument("--ranker-max-depth", type=int, default=6,
+                        help="XGBoost max_depth (default: 6)")
+    parser.add_argument("--ranker-lr", type=float, default=0.1,
+                        help="XGBoost learning rate (default: 0.1)")
 
     # Evaluation settings
     parser.add_argument("--limit", type=int, default=None, help="Limit to N mentions")
