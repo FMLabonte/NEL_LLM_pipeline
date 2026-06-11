@@ -235,44 +235,55 @@ class LLMDisambiguator:
         self,
         model: str = "qwen3.5-9b",
         base_url: str = "http://localhost:1234/v1",
+        api_key: str = "lm-studio",
         temperature: float = 0.6,
-        max_tokens: int = 512,
-        timeout: float = 60.0,
+        max_tokens: int = 2048,
+        timeout: float = 120.0,
+        no_think: bool = False,
     ):
         self.model = model
         self.temperature = temperature
-        self.max_tokens = max_tokens
+        self.max_tokens = max_tokens if not no_think else min(max_tokens, 512)
+        self.no_think = no_think
 
         self.client = OpenAI(
             base_url=base_url,
-            api_key="lm-studio",  # LMStudio doesn't need a real key
+            api_key=api_key,
             timeout=timeout,
         )
 
         # Verify connection and auto-detect model name
+        # Use a short timeout for the models.list() check only
         try:
-            models = self.client.models.list()
+            import httpx
+            quick_client = OpenAI(
+                base_url=base_url, api_key=api_key,
+                timeout=5.0,  # 5s for discovery only
+            )
+            models = quick_client.models.list()
             model_ids = [m.id for m in models.data]
             print(f"Connected to LLM API at {base_url}")
             print(f"  Available models: {model_ids}")
             if model not in model_ids:
-                # LMStudio often uses "org/model" format (e.g., "qwen/qwen3-4b-2507")
-                # Auto-detect: if exactly one model is loaded, use that
                 if len(model_ids) == 1:
                     self.model = model_ids[0]
                     print(f"  Auto-detected model: '{self.model}'")
                 else:
-                    # Try partial match (e.g., "qwen3-4b" matches "qwen/qwen3-4b-2507")
                     matches = [m for m in model_ids if model in m or m in model]
                     if len(matches) == 1:
                         self.model = matches[0]
                         print(f"  Auto-detected model: '{self.model}'")
                     else:
-                        print(f"  Warning: model '{model}' not in list. Using first available.")
-                        self.model = model_ids[0] if model_ids else model
-        except Exception as e:
-            print(f"Warning: Could not connect to LLM API at {base_url}: {e}")
-            print("Make sure LMStudio is running with the server enabled.")
+                        print(f"  Using model as-is: '{self.model}'")
+            else:
+                print(f"  Using model: '{self.model}'")
+        except Exception:
+            print(f"  Using model: '{self.model}' at {base_url}")
+
+        if self.no_think:
+            print(f"  Thinking mode: DISABLED (/no_think) — max_tokens={self.max_tokens}")
+        else:
+            print(f"  Thinking mode: ENABLED — max_tokens={self.max_tokens}")
 
     def disambiguate(
         self,
@@ -295,6 +306,10 @@ class LLMDisambiguator:
             )
 
         user_prompt = _build_user_prompt(mention, candidates, context, title)
+
+        # Append /no_think to disable thinking mode (Qwen3.5)
+        if self.no_think:
+            user_prompt += "\n/no_think"
 
         # Call LLM
         try:

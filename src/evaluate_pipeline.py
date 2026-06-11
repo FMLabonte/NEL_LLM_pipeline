@@ -229,7 +229,9 @@ def run_evaluation(args):
             disambiguator = LLMDisambiguator(
                 model=args.model,
                 base_url=args.base_url,
+                api_key=args.api_key,
                 temperature=args.temperature,
+                no_think=args.phase4_no_think,
             )
         except Exception as e:
             print(f"Warning: Could not connect to LLM: {e}")
@@ -249,7 +251,7 @@ def run_evaluation(args):
         try:
             llm_abbrev_expander = LLMAbbreviationExpander(
                 model=args.llm_abbreviation_model or args.model,
-                base_url=args.base_url,
+                base_url=args.local_base_url,
                 temperature=0.3,
                 debug=args.llm_abbreviation_debug,
             )
@@ -338,7 +340,7 @@ def run_evaluation(args):
         try:
             mini_disambig = MiniDiseaseDisambiguator(
                 model=args.mini_disambig_model or args.model,
-                base_url=args.base_url,
+                base_url=args.local_base_url,
                 ambiguity_threshold=args.mini_disambig_threshold,
                 max_candidates=args.mini_disambig_max_candidates,
                 debug=args.mini_disambig_debug,
@@ -534,6 +536,7 @@ def run_evaluation(args):
 
     llm_calls = 0
     llm_fallbacks = 0
+    llm_skipped = 0  # confidence-based cascading: skipped because Phase 3 was confident
 
     # Learned ranker training data collection
     ranker_train_features = []  # list of list[dict] per mention
@@ -754,32 +757,45 @@ def run_evaluation(args):
             if any(mid in expanded_gold_ids for mid in p3_ids[:k]):
                 p3_at_k[k] += 1
 
-        # ── Phase 4: LLM disambiguation (optional) ──
+        # ── Phase 4: LLM disambiguation (optional, with cascading) ──
         p4_top1 = p3_top1
         p4_hit = p3_hit
         confidence = "phase3"
 
         if disambiguator:
-            ctx = context_lookup.get(pmid, {})
-            sentence = extract_sentence(
-                ctx.get("full_text", ""),
-                mention,
-            )
-            llm_candidates = reranked[:args.llm_top_k]
+            # Confidence-based cascading: check score gap between top-1 and top-2
+            # If Phase 3 is confident (large gap), skip the LLM call
+            score_gap = 0.0
+            if len(reranked) >= 2:
+                score_gap = reranked[0].score - reranked[1].score
 
-            llm_result = disambiguator.disambiguate(
-                mention=mention,
-                candidates=llm_candidates,
-                context=sentence,
-                title=ctx.get("title", ""),
-            )
+            threshold = args.phase4_threshold
+            call_llm = (threshold <= 0.0) or (score_gap < threshold)
 
-            p4_top1 = llm_result.mesh_id
-            p4_hit = p4_top1 in expanded_gold_ids
-            confidence = llm_result.confidence
-            llm_calls += 1
-            if confidence == "fallback":
-                llm_fallbacks += 1
+            if call_llm:
+                ctx = context_lookup.get(pmid, {})
+                sentence = extract_sentence(
+                    ctx.get("full_text", ""),
+                    mention,
+                )
+                llm_candidates = reranked[:args.llm_top_k]
+
+                llm_result = disambiguator.disambiguate(
+                    mention=mention,
+                    candidates=llm_candidates,
+                    context=sentence,
+                    title=ctx.get("title", ""),
+                )
+
+                p4_top1 = llm_result.mesh_id
+                p4_hit = p4_top1 in expanded_gold_ids
+                confidence = llm_result.confidence
+                llm_calls += 1
+                if confidence == "fallback":
+                    llm_fallbacks += 1
+            else:
+                # Phase 3 was confident — skip LLM, keep Phase 3 result
+                llm_skipped += 1
 
         # ── Track results ──
         if p2_hit:
@@ -842,6 +858,8 @@ def run_evaluation(args):
             line += f" P3: {p3_correct*100/total:.1f}%"
             if disambiguator:
                 line += f" P4: {p4_correct*100/total:.1f}%"
+                if llm_skipped > 0:
+                    line += f" (LLM: {llm_calls}, skip: {llm_skipped})"
             line += f" [{elapsed:.0f}s, ETA {eta:.0f}s]"
             print(line, flush=True)
 
@@ -879,7 +897,12 @@ def run_evaluation(args):
         print(f"    P4 vs P2:                  {p4_acc - p2_acc:+.1f}%")
         print(f"")
         print(f"  LLM calls:                   {llm_calls}")
+        print(f"  LLM skipped (confident):     {llm_skipped}")
         print(f"  LLM fallbacks (parse fail):  {llm_fallbacks}")
+        if llm_skipped > 0:
+            print(f"  Cascading threshold:         {args.phase4_threshold:.1f} "
+                  f"(called {llm_calls}/{llm_calls + llm_skipped} = "
+                  f"{llm_calls/(llm_calls + llm_skipped)*100:.0f}%)")
 
     # ── Accuracy@k table ──
     print(f"\n{'─' * 60}")
@@ -1133,8 +1156,20 @@ if __name__ == "__main__":
     parser.add_argument("--no-phase4", action="store_true", help="Skip Phase 4 (LLM)")
     parser.add_argument("--model", default="qwen3.5-9b", help="LLM model name")
     parser.add_argument("--base-url", default="http://localhost:1234/v1", help="LLM API URL")
+    parser.add_argument("--api-key", default="lm-studio",
+                        help="API key for LLM endpoint (default: lm-studio for local)")
+    parser.add_argument("--local-base-url", default="http://localhost:1234/v1",
+                        help="Local LMStudio URL for abbreviation expander / mini disambiguator "
+                             "(default: http://localhost:1234/v1)")
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--llm-top-k", type=int, default=10, help="Candidates to pass to LLM")
+    parser.add_argument("--phase4-threshold", type=float, default=0.0,
+                        help="Confidence-based cascading: only call LLM when score gap between "
+                             "top-1 and top-2 is below this threshold. 0 = call LLM for all "
+                             "(default: 0). Typical values: 10-20.")
+    parser.add_argument("--phase4-no-think", action="store_true",
+                        help="Disable thinking mode for Phase 4 LLM (/no_think). "
+                             "Much faster (~5s vs ~50s) but potentially lower quality.")
 
     # Learned Ranker (XGBoost)
     parser.add_argument("--train-ranker", action="store_true",
