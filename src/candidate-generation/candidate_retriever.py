@@ -84,7 +84,7 @@ def _build_id_mapping(index: MeSHIndex, mrconso_path: str | None = None) -> dict
     if mrconso_path and Path(mrconso_path).exists():
         # ── CUI-based mapping (most accurate) ──
         # Step 1: Collect all CUI → MeSH ID associations
-        print("  Building ID mapping from MRCONSO.RRF...")
+        # Build CUI→MeSH ID mapping from MRCONSO
         cui_to_mesh_ids: dict[str, set[str]] = {}
 
         with open(mrconso_path, "r", encoding="utf-8") as f:
@@ -105,7 +105,7 @@ def _build_id_mapping(index: MeSHIndex, mrconso_path: str | None = None) -> dict
                 for mid in mesh_ids:
                     id_map[mid] = mesh_ids - {mid}
 
-        print(f"  Found {len(id_map)} MeSH IDs with alternative mappings")
+        # Found alternative ID mappings
 
     # ── Name-based fallback: build label → mesh_id lookup from index ──
     # This catches cases where old C-IDs are completely gone from MRCONSO

@@ -128,9 +128,7 @@ def run_evaluation(args):
         # UMLS index mode: search against full UMLS (broader synonym coverage)
         if not HAS_UMLS_INDEX:
             raise ImportError("UMLSIndex not available. Check umls_index.py in candidate-generation/")
-        print("=" * 60)
-        print(f"Building UMLS index...")
-        print("=" * 60)
+        print("Building UMLS index...")
 
         mrconso = args.umls or str(PROJECT_ROOT / "Data" / "UMLS" / "MRCONSO.RRF")
         vocabs = args.umls_vocabs.split(",") if args.umls_vocabs else None
@@ -144,7 +142,7 @@ def run_evaluation(args):
         retriever = CandidateRetriever(index, top_k=args.top_k)
 
         # Also build a lightweight MeSH index for Phase 3 domain rules (needs tree numbers)
-        print("\n  Building MeSH index for domain rules (Phase 3)...")
+        print("  + MeSH index for Phase 3 rules...")
         mesh_index_for_rules = MeSHIndex(backend=args.backend)
         mesh_index_for_rules.build_from_xml(
             descriptor_path=str(PROJECT_ROOT / "Data" / "MeSH" / "desc2026.xml"),
@@ -155,9 +153,7 @@ def run_evaluation(args):
         )
     else:
         # Standard MeSH index mode
-        print("=" * 60)
-        print(f"Building MeSH index (backend={args.backend})...")
-        print("=" * 60)
+        print(f"Building MeSH index ({args.backend})...")
 
         index = MeSHIndex(backend=args.backend, es_url=args.es_url)
         index.build_from_xml(
@@ -181,16 +177,15 @@ def run_evaluation(args):
         if Path(mrrel).exists() and Path(mrconso).exists():
             umls_bridge = UMLSRelationExpander(mrconso, mrrel)
             umls_bridge.build_bridge()
-            print(f"  UMLS bridge loaded: {len(umls_bridge.bridge)} entries")
+            pass  # UMLS bridge loaded
         else:
-            print("  UMLS bridge: MRREL/MRCONSO not found, skipping UMLS bridge expansion")
+            pass  # UMLS bridge files not found
 
         expander = CandidateExpander(
             mesh_index_for_rules, retriever, umls_bridge=umls_bridge,
         )
-        print("  Candidate expander initialized (UMLS bridge + multi-word + parent injection)")
     else:
-        print("  Candidate expansion: DISABLED")
+        pass  # no expansion
 
     # ── Step 2: Load enrichment caches for Phase 3 ──
     cache_dir = PROJECT_ROOT / "src" / "candidate-generation" / "cache"
@@ -209,7 +204,7 @@ def run_evaluation(args):
                 dbpedia = data
             else:
                 umls_cache = data
-            print(f"  Loaded {label} cache: {len(data)} entities")
+            pass  # cache loaded silently
 
     # ── Step 3: Create Phase 3 reranker ──
     reranker = DomainRuleReranker(
@@ -231,7 +226,11 @@ def run_evaluation(args):
                 base_url=args.base_url,
                 api_key=args.api_key,
                 temperature=args.temperature,
+                max_tokens=args.max_tokens,
                 no_think=args.phase4_no_think,
+                prompt_version=args.prompt_version,
+                shuffle_candidates=args.shuffle_candidates,
+                shuffle_seed=args.shuffle_seed if args.shuffle_candidates else None,
             )
         except Exception as e:
             print(f"Warning: Could not connect to LLM: {e}")
@@ -241,9 +240,6 @@ def run_evaluation(args):
     abbrev_expander = None
     if not args.no_abbreviation_expansion:
         abbrev_expander = AbbreviationExpander()
-        print("  Abbreviation expander: ENABLED")
-    else:
-        print("  Abbreviation expander: DISABLED")
 
     # ── Step 4b2: LLM Abbreviation Expander (optional fallback) ──
     llm_abbrev_expander = None
@@ -255,13 +251,8 @@ def run_evaluation(args):
                 temperature=0.3,
                 debug=args.llm_abbreviation_debug,
             )
-            print("  LLM abbreviation expander: ENABLED (fallback after rule-based)")
         except Exception as e:
-            print(f"  LLM abbreviation expander: FAILED ({e})")
-    elif args.llm_abbreviation and not HAS_LLM_ABBREV:
-        print("  LLM abbreviation expander: DISABLED (openai package not installed)")
-    else:
-        print("  LLM abbreviation expander: DISABLED")
+            print(f"  Warning: LLM abbreviation expander failed: {e}")
 
     # ── Step 4c: Embedding Retriever (optional) ──
     emb_retriever = None
@@ -281,7 +272,6 @@ def run_evaluation(args):
                 batch_size=args.embedding_batch_size,
             )
             emb_retriever.build_or_load(cache_dir)
-            print(f"  Embedding retriever: MULTI-MODEL ({', '.join(m.split('/')[-1] for m in models)})")
         else:
             # Single model
             emb_retriever = EmbeddingRetriever(
@@ -290,14 +280,8 @@ def run_evaluation(args):
                 batch_size=args.embedding_batch_size,
             )
             emb_retriever.build_or_load(cache_dir)
-            print(f"  Embedding retriever: ENABLED ({args.embedding_model})")
-        print(f"  Hybrid scoring: alpha={args.hybrid_alpha} "
-              f"({args.hybrid_alpha*100:.0f}% string + {(1-args.hybrid_alpha)*100:.0f}% embedding)")
     elif args.embedding and not HAS_EMBEDDING:
-        print("  Embedding retriever: DISABLED (torch/transformers/faiss not installed)")
-        print("    Install with: pip install torch transformers faiss-cpu")
-    else:
-        print("  Embedding retriever: DISABLED")
+        print("  Warning: embedding retriever unavailable (pip install torch transformers faiss-cpu)")
 
     # ── Step 4d: Hybrid Scorer (created alongside embedding retriever) ──
     hybrid_scorer = None
@@ -312,9 +296,6 @@ def run_evaluation(args):
             penalty=args.topic_penalty,
             min_signal=args.topic_min_signal,
         )
-        print(f"  Document topic scoring: ENABLED (boost={args.topic_boost}, penalty={args.topic_penalty})")
-    else:
-        print("  Document topic scoring: DISABLED")
 
     # ── Step 4f: Sentence-Context Scorer (optional, Disease-focused) ──
     sentence_scorer = None
@@ -325,14 +306,8 @@ def run_evaluation(args):
             ambiguity_threshold=args.sentence_context_threshold,
             disease_only=True,
         )
-        print(f"  Sentence-context scoring: ENABLED (weight={args.sentence_context_weight}, "
-              f"threshold={args.sentence_context_threshold}, Disease-only)")
     elif args.sentence_context and emb_retriever is None:
-        print("  Sentence-context scoring: DISABLED (requires --embedding)")
-    elif args.sentence_context and not HAS_SENTENCE_CONTEXT:
-        print("  Sentence-context scoring: DISABLED (module not found)")
-    else:
-        print("  Sentence-context scoring: DISABLED")
+        print("  Warning: sentence-context scoring requires --embedding")
 
     # ── Step 4g: Mini Disease Disambiguator (optional, Disease-focused) ──
     mini_disambig = None
@@ -345,37 +320,50 @@ def run_evaluation(args):
                 max_candidates=args.mini_disambig_max_candidates,
                 debug=args.mini_disambig_debug,
             )
-            print(f"  Mini Disease Disambiguator: ENABLED "
-                  f"(threshold={args.mini_disambig_threshold}, "
-                  f"max_candidates={args.mini_disambig_max_candidates})")
         except Exception as e:
-            print(f"  Mini Disease Disambiguator: FAILED ({e})")
-    elif args.mini_disambig and not HAS_MINI_DISAMBIG:
-        print("  Mini Disease Disambiguator: DISABLED (module not found)")
-    else:
-        print("  Mini Disease Disambiguator: DISABLED")
+            print(f"  Warning: Mini Disease Disambiguator failed: {e}")
 
     # ── Step 4h: Learned Ranker (optional, XGBoost) ──
     learned_ranker = None
     if args.learned_ranker and HAS_LEARNED_RANKER:
         try:
             learned_ranker = LearnedRanker(model_path=args.learned_ranker)
-            print(f"  Learned ranker: ENABLED (loaded from {args.learned_ranker})")
         except Exception as e:
-            print(f"  Learned ranker: FAILED ({e})")
+            print(f"  Warning: Learned ranker failed: {e}")
     elif args.train_ranker and HAS_LEARNED_RANKER:
-        print(f"  Learned ranker: TRAINING MODE (will train after evaluation)")
+        pass  # will train after evaluation
     elif (args.learned_ranker or args.train_ranker) and not HAS_LEARNED_RANKER:
-        print("  Learned ranker: DISABLED (xgboost not installed)")
-    else:
-        print("  Learned ranker: DISABLED")
+        print("  Warning: xgboost not installed for learned ranker")
+
+    # ── Feature summary (compact) ──
+    features_on = []
+    if expander:
+        features_on.append("expansion")
+    if abbrev_expander:
+        features_on.append("abbrev")
+    if llm_abbrev_expander:
+        features_on.append("llm-abbrev")
+    if emb_retriever:
+        model_short = args.embedding_model.split("/")[-1] if not args.embedding_multi else "multi"
+        features_on.append(f"embedding({model_short})")
+    if hybrid_scorer:
+        features_on.append(f"hybrid(α={args.hybrid_alpha})")
+    if topic_scorer:
+        features_on.append("topic-scoring")
+    if sentence_scorer:
+        features_on.append("sentence-context")
+    if mini_disambig:
+        features_on.append("mini-disambig")
+    if learned_ranker:
+        features_on.append("learned-ranker")
+    if args.train_ranker:
+        features_on.append("ranker-training")
+    print(f"  Features: {', '.join(features_on) if features_on else 'none'}")
 
     # ── Step 5: Load dataset ──
-    print("\n" + "=" * 60)
     dataset_name = args.dataset.upper()
     split_label = args.split.upper() if hasattr(args, 'split') else "TEST"
-    print(f"Loading {dataset_name} {split_label} set...")
-    print("=" * 60)
+    print(f"Loading {dataset_name} {split_label}...")
 
     if args.dataset == "bc5cdr":
         split_map = {"train": "TrainingSet", "dev": "DevelopmentSet", "test": "TestSet"}
@@ -417,9 +405,7 @@ def run_evaluation(args):
         mesh_mask = eval_df["mesh_id"].str.match(r'^[DC]\d+', na=False)
         skipped = len(eval_df) - mesh_mask.sum()
         eval_df = eval_df[mesh_mask]
-        print(f"  Filtered to MeSH-linkable entities: {len(eval_df)} (skipped {skipped} non-MeSH)")
-        # Show entity type breakdown
-        print(f"  Entity types: {dict(eval_df['entity_type'].value_counts())}")
+        print(f"  Filtered to MeSH-linkable: {len(eval_df)} (skipped {skipped})")
 
     elif args.dataset == "medmentions":
         # MedMentions uses UMLS CUI format "UMLS:C0010674"
@@ -441,12 +427,9 @@ def run_evaluation(args):
                 skipped = (~eval_df["has_mesh"]).sum()
                 eval_df = eval_df[eval_df["has_mesh"]].copy()
                 eval_df = eval_df.drop(columns=["has_mesh"])
-                print(f"  UMLS index (FAIR COMPARISON): {len(eval_df)} annotations with MeSH mapping "
-                      f"(skipped {skipped} without MeSH)")
-                print(f"  Unique CUIs: {eval_df['cui'].nunique()}")
+                print(f"  UMLS fair-comparison: {len(eval_df)} annotations (skipped {skipped})")
             else:
-                print(f"  UMLS index mode: evaluating ALL {len(eval_df)} annotations (no CUI→MeSH filtering)")
-                print(f"  Unique CUIs: {eval_df['cui'].nunique()}")
+                pass  # evaluating all annotations
         else:
             # MeSH index mode: need CUI→MeSH mapping (only 63% of annotations)
             mrconso_path = args.umls or str(PROJECT_ROOT / "Data" / "UMLS" / "MRCONSO.RRF")
@@ -466,8 +449,7 @@ def run_evaluation(args):
             eval_df["mesh_id"] = eval_df["cui"].apply(cui_to_mesh_str)
 
             eval_df = eval_df.drop(columns=["has_mesh"])
-            print(f"  CUI→MeSH mapping: {len(eval_df)} annotations mappable (skipped {skipped} without MeSH)")
-            print(f"  Unique CUIs mapped: {eval_df['cui'].nunique()}")
+            print(f"  CUI→MeSH: {len(eval_df)} mappable (skipped {skipped})")
 
     # Remove entries with no valid ID and deduplicate
     eval_df = eval_df[eval_df["mesh_id"] != "-1"].drop_duplicates(subset=["mention", "mesh_id"])
@@ -476,10 +458,11 @@ def run_evaluation(args):
         eval_df = eval_df.head(args.limit)
 
     n_pairs = len(eval_df)
-    print(f"  {n_pairs} unique (mention, mesh_id) pairs to evaluate")
+    print(f"  Evaluating {n_pairs} mention-entity pairs"
+          + (f" (limited to {args.limit})" if args.limit else ""))
 
     # ── Step 6: Run evaluation ──
-    print("\n" + "=" * 60)
+    print("=" * 60)
     phases_label = ""
     if abbrev_expander:
         if llm_abbrev_expander:
@@ -492,9 +475,7 @@ def run_evaluation(args):
     phases_label += " → 3"
     if disambiguator:
         phases_label += " → 4"
-    print(f"Running {phases_label} evaluation...")
-    if disambiguator:
-        print(f"  LLM: {disambiguator.model}, top_k={args.llm_top_k}")
+    print(f"Running {phases_label}...")
     print("=" * 60)
 
     total = 0
@@ -774,16 +755,19 @@ def run_evaluation(args):
 
             if call_llm:
                 ctx = context_lookup.get(pmid, {})
-                sentence = extract_sentence(
-                    ctx.get("full_text", ""),
-                    mention,
-                )
+                full_text = ctx.get("full_text", "")
                 llm_candidates = reranked[:args.llm_top_k]
+
+                # Pass full abstract or sentence snippet depending on prompt version
+                if disambiguator.prompt_config.use_full_context:
+                    llm_context = full_text
+                else:
+                    llm_context = extract_sentence(full_text, mention)
 
                 llm_result = disambiguator.disambiguate(
                     mention=mention,
                     candidates=llm_candidates,
-                    context=sentence,
+                    context=llm_context,
                     title=ctx.get("title", ""),
                 )
 
@@ -903,6 +887,8 @@ def run_evaluation(args):
             print(f"  Cascading threshold:         {args.phase4_threshold:.1f} "
                   f"(called {llm_calls}/{llm_calls + llm_skipped} = "
                   f"{llm_calls/(llm_calls + llm_skipped)*100:.0f}%)")
+        # Token usage & cost summary
+        print(disambiguator.get_usage_summary())
 
     # ── Accuracy@k table ──
     print(f"\n{'─' * 60}")
@@ -1167,9 +1153,24 @@ if __name__ == "__main__":
                         help="Confidence-based cascading: only call LLM when score gap between "
                              "top-1 and top-2 is below this threshold. 0 = call LLM for all "
                              "(default: 0). Typical values: 10-20.")
+    parser.add_argument("--max-tokens", type=int, default=8192,
+                        help="Max tokens for LLM response (default: 8192). "
+                             "Higher values allow more reasoning. Typical range: 4096-16384.")
     parser.add_argument("--phase4-no-think", action="store_true",
                         help="Disable thinking mode for Phase 4 LLM (/no_think). "
                              "Much faster (~5s vs ~50s) but potentially lower quality.")
+    parser.add_argument("--prompt-version", choices=["v1", "v2", "v3", "v4", "v5", "v6"], default="v4",
+                        help="Phase 4 prompt version: v1 = original (reasoning + number), "
+                             "v2 = concise (number + few-shot), "
+                             "v3 = JSON + full context (no scores), "
+                             "v4 = JSON + scores + sentence context, "
+                             "v5 = enhanced v1 (reasoning + specificity fix + few-shot), "
+                             "v6 = v5 reasoning + JSON output (0 parse fails) (default: v4)")
+    parser.add_argument("--shuffle-candidates", action="store_true",
+                        help="Shuffle candidate order before passing to LLM "
+                             "(tests position bias)")
+    parser.add_argument("--shuffle-seed", type=int, default=42,
+                        help="Random seed for candidate shuffling (default: 42)")
 
     # Learned Ranker (XGBoost)
     parser.add_argument("--train-ranker", action="store_true",

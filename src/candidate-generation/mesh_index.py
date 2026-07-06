@@ -209,7 +209,7 @@ class MeSHIndex:
         else:
             self._build_label_index()
 
-        print(f"MeSH index built ({self.backend}): {self.size} entities")
+        print(f"MeSH index ready: {self.size} entities ({self.backend})")
 
     def _enrich_from_wikidata(self):
         """
@@ -235,8 +235,7 @@ class MeSHIndex:
                     added_count += len(new_syns)
                     matched_entities += 1
 
-        print(f"  Wikidata enrichment: added {added_count} new synonyms "
-              f"to {matched_entities} entities")
+        print(f"  + Wikidata: {added_count} synonyms ({matched_entities} entities)")
 
     def _enrich_from_dbpedia(self):
         """
@@ -261,8 +260,7 @@ class MeSHIndex:
                     added_count += len(new_syns)
                     matched_entities += 1
 
-        print(f"  DBpedia enrichment: added {added_count} new synonyms "
-              f"to {matched_entities} entities")
+        print(f"  + DBpedia: {added_count} synonyms ({matched_entities} entities)")
 
     def _enrich_from_umls(self, mrconso_path: str):
         """
@@ -288,8 +286,7 @@ class MeSHIndex:
                     added_count += len(new_syns)
                     matched_entities += 1
 
-        print(f"  UMLS enrichment: added {added_count} new synonyms "
-              f"to {matched_entities} entities")
+        print(f"  + UMLS: {added_count} synonyms ({matched_entities} entities)")
 
     def _enrich_from_mondo(self):
         """
@@ -315,12 +312,10 @@ class MeSHIndex:
                     added_count += len(new_syns)
                     matched_entities += 1
 
-        print(f"  MONDO enrichment: added {added_count} new synonyms "
-              f"to {matched_entities} entities")
+        print(f"  + MONDO: {added_count} synonyms ({matched_entities} entities)")
 
     def _parse_descriptors(self, path: str):
         """Parse MeSH descriptor XML (desc2026.xml)."""
-        print(f"Parsing descriptors from {path}...")
         count = 0
 
         for event, elem in ET.iterparse(path, events=("end",)):
@@ -354,16 +349,12 @@ class MeSHIndex:
             # Free memory as we go (important for large XML files)
             elem.clear()
 
-            # Progress indicator
             count += 1
-            if count % 5000 == 0:
-                print(f"  ... {count} descriptors parsed", flush=True)
 
-        print(f"  Done: {count} descriptors loaded.")
+        print(f"  Descriptors: {count}", end="", flush=True)
 
     def _parse_supplementary(self, path: str):
         """Parse MeSH supplementary concepts XML (supp2026.xml)."""
-        print(f"Parsing supplementary concepts from {path}...")
         count = 0
 
         for event, elem in ET.iterparse(path, events=("end",)):
@@ -391,12 +382,9 @@ class MeSHIndex:
 
             elem.clear()
 
-            # Progress indicator (supplementary has ~324K records)
             count += 1
-            if count % 25000 == 0:
-                print(f"  ... {count} supplementary concepts parsed", flush=True)
 
-        print(f"  Done: {count} supplementary concepts loaded.")
+        print(f" + Supplementary: {count}")
 
     # ── rapidfuzz index ────────────────────────────────────────────────
 
@@ -411,7 +399,7 @@ class MeSHIndex:
                 normalized = synonym if self.case_sensitive else synonym.lower()
                 self._label_index.append((normalized, mesh_id))
 
-        print(f"  {len(self._label_index)} searchable labels indexed (rapidfuzz)")
+        print(f" | {len(self._label_index)} labels indexed")
 
     # ── Elasticsearch index ────────────────────────────────────────────
 
@@ -423,14 +411,13 @@ class MeSHIndex:
         """
         # ES 8.x Python client: pass URL as string, not list.
         # Also need to explicitly set _meta header to avoid warnings.
-        print(f"  Connecting to Elasticsearch at {self._es_url}...")
+        # Connect to Elasticsearch
         self._es_client = Elasticsearch(self._es_url)
 
         # Check connection — catch the actual error for debugging
         try:
             info = self._es_client.info()
-            print(f"  Connected to ES cluster '{info['cluster_name']}' "
-                  f"(version {info['version']['number']})")
+            pass  # connected OK
         except Exception as e:
             raise ConnectionError(
                 f"Cannot connect to Elasticsearch at {self._es_url}: {e}\n"
@@ -439,7 +426,6 @@ class MeSHIndex:
 
         # Delete old index if it exists and recreate
         if self._es_client.indices.exists(index=self._es_index_name):
-            print(f"  Deleting existing ES index '{self._es_index_name}'...")
             self._es_client.indices.delete(index=self._es_index_name)
 
         # Create index with custom mapping optimized for entity search
@@ -481,7 +467,6 @@ class MeSHIndex:
         }
 
         self._es_client.indices.create(index=self._es_index_name, body=mapping)
-        print(f"  Created ES index '{self._es_index_name}' with BM25 scoring")
 
         # Bulk-index all entities
         def _generate_actions():
@@ -500,14 +485,17 @@ class MeSHIndex:
                     }
                 }
 
-        print(f"  Indexing {self.size} entities into Elasticsearch...")
         success, errors = helpers.bulk(
             self._es_client,
             _generate_actions(),
             chunk_size=5000,
             raise_on_error=False,
         )
-        print(f"  Done: {success} documents indexed, {len(errors) if isinstance(errors, list) else errors} errors")
+        err_count = len(errors) if isinstance(errors, list) else errors
+        if err_count:
+            print(f"  ES index: {success} indexed, {err_count} errors")
+        else:
+            print(f"  ES index: {success} documents")
 
         # Refresh so documents are immediately searchable
         self._es_client.indices.refresh(index=self._es_index_name)

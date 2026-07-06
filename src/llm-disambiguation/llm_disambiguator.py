@@ -1,225 +1,58 @@
 """
 LLM Disambiguator
 ==================
-Given a list of candidate entities and the document context, a LLM tries to select the best matching candidate.
+Given a list of candidate entities and the document context, an LLM
+selects the best matching candidate.
 
-The LLM receives:
-  - The paper context (title and abstract)
-  - The mention (surface form highlighted in its sentence. Additionally, 2 sentences before and after that)
-  - A numbered list of candidate entities with labels, definitions, synonyms
-  - An instruction to pick the best match
-
-Connects to LMStudio (or any OpenAI-compatible API) via the openai package.
+Prompt construction, response parsing, and version management are
+handled by prompts.py — this module handles the API connection,
+retry logic, token tracking, and pipeline interface.
 
 Usage:
     from llm_disambiguator import LLMDisambiguator
 
     disambiguator = LLMDisambiguator(
-        model="qwen3-4b-2507",
-        base_url="http://localhost:1234/v1")
+        model="openai/gpt-4o-mini",
+        base_url="http://131.220.150.238:8080",
+        api_key="sk-...",
+        prompt_version="v3",
+    )
 
     result = disambiguator.disambiguate(
-        mention="...",
+        mention="CF",
         candidates=[...],
-        context="...",
-        title="...")
-
-    # result.mesh_id -> "..."
+        context="full abstract text...",
+        title="Paper title",
+    )
+    # result.mesh_id -> "D003550"
 """
 
-import re
 import time
-import sys
+import random
 from dataclasses import dataclass
-from pathlib import Path
 
 from openai import OpenAI
+
+from prompts import (
+    get_prompt_config,
+    build_user_prompt,
+    parse_response,
+    list_prompts,
+    PromptConfig,
+)
 
 
 # ── Data classes ───────────────────────────────────────────────────────────
 
 @dataclass
 class DisambiguationResult:
-    """
-    Result of LLM disambiguation for a single mention.
-    """
-    mention: str # original mention text
-    mesh_id: str # chosen by LLM
+    """Result of LLM disambiguation for a single mention."""
+    mention: str
+    mesh_id: str
     preferred_label: str
-    chosen_rank: int # -1 if LLM chose NONE
-    confidence: str  # "llm" or "fallback"
-    raw_response: str # for debugging purposes
-
-
-# ── Prompt templates ──────────────────────────────────────────────────────
-
-SYSTEM_PROMPT = """
-You are a biomedical entity linking expert. Your task is to link entity mentions in biomedical texts to the correct MeSH (Medical Subject Headings) identifier.
-
-You will be given:
-1. A biomedical text (title and abstract of a paper)
-2. A highlighted mention (the entity to link) inside the sentence, including 2 sentences before and after that mention
-3. A numbered list of candidate MeSH entities, which was already ranked using domain specific rules
-
-Your job: Select the candidate that best matches the mention IN CONTEXT. Consider:
-- The meaning of the mention in its specific context
-- Whether the candidate's definition fits the usage
-- Synonyms and alternative names
-
-Think step by step: First, identify what the mention refers to in this context. Then, compare it against the candidates and pick the best match.
-
-Respond with your reasoning in 1-2 sentences, then on a new line write ONLY the number of your chosen candidate (e.g., "1" or "3"). If none of the candidates match, write "NONE".
-"""
-
-def _extract_mention_window(context: str, mention: str, n_sentences: int = 2) -> str:
-    """
-    Extract the sentence containing the mention plus n sentences before and after.
-    The mention is highlighted with **markers** in the output.
-    """
-    import re as _re
-
-    # Split context into sentences (handles ". ", "? ", "! " and end-of-string)
-    sentences = _re.split(r'(?<=[.!?])\s+', context.strip())
-    if not sentences:
-        return context
-
-    # Find which sentence contains the mention (case-insensitive)
-    mention_lower = mention.lower()
-    mention_idx = None
-    for i, sent in enumerate(sentences):
-        if mention_lower in sent.lower():
-            mention_idx = i
-            break
-
-    if mention_idx is None:
-        # Mention isn't found in sentences, return full context with highlight
-        highlighted = context.replace(mention, f"**{mention}**", 1)
-        return highlighted
-
-    # Extract window: n sentences before + mention sentence + n sentences after
-    start = max(0, mention_idx - n_sentences)
-    end = min(len(sentences), mention_idx + n_sentences + 1)
-    window = sentences[start:end]
-
-    # Highlight the mention in the relevant sentence
-    window_text = " ".join(window)
-    # Case-preserving highlight
-    idx = window_text.lower().find(mention_lower)
-    if idx >= 0:
-        original = window_text[idx:idx + len(mention)]
-        window_text = window_text[:idx] + f"**{original}**" + window_text[idx + len(mention):]
-
-    return window_text
-
-
-def _build_user_prompt(
-    mention: str,
-    candidates: list,
-    context: str,
-    title: str = "",
-    max_definition_len: int = 150,
-    max_synonyms: int = 3,
-) -> str:
-
-    # Build context section
-    parts = []
-    parts.append("## Biomedical Text")
-    if title:
-        parts.append(f"**Title:** {title}")
-    parts.append(f"**Text:** {context}")
-    parts.append("")
-
-    # Extract mention with surrounding sentences (2 before + 2 after)
-    mention_window = _extract_mention_window(context, mention, n_sentences=2)
-    parts.append(f'## Mention to Link: "{mention}"')
-    parts.append(f"**Context window:** {mention_window}")
-    parts.append("")
-
-    # Build candidate list
-    parts.append("## Candidates")
-    for i, c in enumerate(candidates, 1):
-        # Label
-        line = f"{i}. **{c.preferred_label}** [{c.mesh_id}]"
-        parts.append(line)
-
-        # Semantic category from MeSH tree numbers (e.g., "Diseases", "Chemicals and Drugs")
-        tree_numbers = getattr(c, "tree_numbers", [])
-        if tree_numbers:
-            _TREE_CATS = {"A": "Anatomy", "B": "Organisms", "C": "Diseases",
-                          "D": "Chemicals and Drugs", "E": "Techniques", "F": "Psychology",
-                          "G": "Phenomena", "N": "Health Care"}
-            cats = sorted({_TREE_CATS.get(tn[0], tn[0]) for tn in tree_numbers if tn})
-            parts.append(f"   Category: {', '.join(cats)}")
-
-        # Definition (truncated)
-        if c.definition:
-            defn = c.definition
-            if len(defn) > max_definition_len:
-                defn = defn[:max_definition_len] + "..."
-            parts.append(f"   Definition: {defn}")
-
-        # Synonyms (top few, excluding the preferred label)
-        other_syns = [s for s in c.synonyms if s.lower() != c.preferred_label.lower()]
-        if other_syns:
-            shown = other_syns[:max_synonyms]
-            parts.append(f"   Synonyms: {', '.join(shown)}")
-
-        # Score from domain specific rules
-        parts.append(f"   Match score: {c.score:.1f}")
-        parts.append("")
-
-    parts.append("Which candidate best matches the mention in the given context? Reply with ONLY the number.")
-
-    return "\n".join(parts)
-
-
-def _strip_thinking_tags(response: str) -> str:
-    """
-    Strip <think>...</think> blocks from model output.
-    Qwen3.5 and similar models emit thinking tokens wrapped in these tags.
-    """
-    return re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
-
-
-def _parse_llm_response(response: str, num_candidates: int) -> int | None:
-    # Strip thinking tags (Qwen3.5 outputs <think>...</think> before answer)
-    text = _strip_thinking_tags(response).strip()
-
-    # Check for case NONE
-    if text.upper() == "NONE":
-        return None
-
-    # Try to extract a number from the LAST line (CoT reasoning comes first)
-    lines = [l.strip() for l in text.strip().split('\n') if l.strip()]
-    if lines:
-        last_line = lines[-1]
-        # If last line is just a number
-        if last_line.isdigit():
-            num = int(last_line)
-            if 1 <= num <= num_candidates:
-                return num
-        # If last line contains a number
-        match = re.search(r'\b(\d+)\b', last_line)
-        if match:
-            num = int(match.group(1))
-            if 1 <= num <= num_candidates:
-                return num
-
-    # Fallback: find any number in the full response
-    # First try: just a plain number
-    if text.isdigit():
-        num = int(text)
-        if 1 <= num <= num_candidates:
-            return num
-
-    # Second try: find the last number in the response (most likely the answer)
-    matches = re.findall(r'\b(\d+)\b', text)
-    if matches:
-        num = int(matches[-1])
-        if 1 <= num <= num_candidates:
-            return num
-
-    return None
+    chosen_rank: int        # 1-based index, -1 if fallback
+    confidence: str         # "llm" or "fallback"
+    raw_response: str
 
 
 # ── Main disambiguator class ──────────────────────────────────────────────
@@ -228,7 +61,8 @@ class LLMDisambiguator:
     """
     Uses an LLM to disambiguate between candidate entities.
 
-    Connects to an OpenAI-compatible API (e.g., LMStudio).
+    Connects to an OpenAI-compatible API (LMStudio, LiteLLM proxy, etc.)
+    and uses prompt configs from prompts.py.
     """
 
     def __init__(
@@ -237,14 +71,24 @@ class LLMDisambiguator:
         base_url: str = "http://localhost:1234/v1",
         api_key: str = "lm-studio",
         temperature: float = 0.6,
-        max_tokens: int = 2048,
-        timeout: float = 120.0,
+        max_tokens: int = 8192,
+        timeout: float = 300.0,
         no_think: bool = False,
+        prompt_version: str = "v3",
+        shuffle_candidates: bool = False,
+        shuffle_seed: int | None = None,
     ):
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens if not no_think else min(max_tokens, 512)
         self.no_think = no_think
+        self.shuffle_candidates = shuffle_candidates
+
+        # Load prompt config from registry
+        self.prompt_config = get_prompt_config(prompt_version)
+
+        # Set up shuffling RNG (deterministic if seed is given)
+        self._rng = random.Random(shuffle_seed) if shuffle_candidates else None
 
         self.client = OpenAI(
             base_url=base_url,
@@ -252,38 +96,53 @@ class LLMDisambiguator:
             timeout=timeout,
         )
 
+        # Token usage tracking
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+
+        # Pricing per 1M tokens (input, output)
+        self._pricing = {
+            "openai/gpt-4o-mini":              (0.15,  0.60),
+            "openai/gpt-4.1-mini":             (0.40,  1.60),
+            "openai/gpt-4.1-nano":             (0.10,  0.40),
+            "openai/gpt-5-nano":               (0.20,  1.25),
+            "openai/gpt-5-mini":               (0.75,  4.50),
+            "openai/gpt-5.5":                  (5.00, 30.00),
+            "mistral/mistral-small-latest":     (0.10,  0.30),
+            "mistral/mistral-small":            (0.10,  0.30),
+            "mistral/magistral-medium-latest":  (2.00,  5.00),
+            "mistral/mistral-large-latest":     (2.00,  6.00),
+        }
+
         # Verify connection and auto-detect model name
-        # Use a short timeout for the models.list() check only
         try:
-            import httpx
             quick_client = OpenAI(
-                base_url=base_url, api_key=api_key,
-                timeout=5.0,  # 5s for discovery only
+                base_url=base_url, api_key=api_key, timeout=5.0,
             )
             models = quick_client.models.list()
             model_ids = [m.id for m in models.data]
-            print(f"Connected to LLM API at {base_url}")
-            print(f"  Available models: {model_ids}")
             if model not in model_ids:
                 if len(model_ids) == 1:
                     self.model = model_ids[0]
-                    print(f"  Auto-detected model: '{self.model}'")
                 else:
                     matches = [m for m in model_ids if model in m or m in model]
                     if len(matches) == 1:
                         self.model = matches[0]
-                        print(f"  Auto-detected model: '{self.model}'")
-                    else:
-                        print(f"  Using model as-is: '{self.model}'")
-            else:
-                print(f"  Using model: '{self.model}'")
         except Exception:
-            print(f"  Using model: '{self.model}' at {base_url}")
+            pass
 
-        if self.no_think:
-            print(f"  Thinking mode: DISABLED (/no_think) — max_tokens={self.max_tokens}")
-        else:
-            print(f"  Thinking mode: ENABLED — max_tokens={self.max_tokens}")
+        # Log config (compact)
+        think_label = "no_think" if self.no_think else "think"
+        shuffle_label = (
+            f", shuffle=seed{shuffle_seed}" if self.shuffle_candidates and shuffle_seed
+            else ", shuffle=random" if self.shuffle_candidates
+            else ""
+        )
+        print(f"  LLM: {self.model} | prompt={self.prompt_config.name} "
+              f"({self.prompt_config.response_format}) | "
+              f"{think_label}, max_tokens={self.max_tokens}{shuffle_label}")
+
+    # ── Main disambiguation method ────────────────────────────────────────
 
     def disambiguate(
         self,
@@ -293,50 +152,91 @@ class LLMDisambiguator:
         title: str = "",
     ) -> DisambiguationResult:
         """
-        This is the interface for the pipeline.
+        Disambiguate a mention using the LLM.
+
+        Parameters
+        ----------
+        mention : str
+            The entity mention text (e.g., "CF", "seizures").
+        candidates : list[CandidateEntity]
+            Ranked candidates from Phase 3. Order may be shuffled
+            if shuffle_candidates is enabled.
+        context : str
+            Document text. Should be the full abstract if the prompt
+            config uses full_context, otherwise a sentence snippet.
+        title : str
+            Paper title.
         """
         if not candidates:
             return DisambiguationResult(
-                mention=mention,
-                mesh_id="NONE",
-                preferred_label="",
-                chosen_rank=-1,
-                confidence="fallback",
-                raw_response="",
+                mention=mention, mesh_id="NONE", preferred_label="",
+                chosen_rank=-1, confidence="fallback", raw_response="",
             )
 
-        user_prompt = _build_user_prompt(mention, candidates, context, title)
+        # Optionally shuffle candidate order (to test position bias)
+        if self._rng is not None:
+            candidates = list(candidates)  # copy
+            self._rng.shuffle(candidates)
 
-        # Append /no_think to disable thinking mode (Qwen3.5)
+        # Build prompt
+        user_prompt = build_user_prompt(
+            self.prompt_config, mention, candidates, context, title,
+        )
+
+        # Append /no_think for Qwen3.5 models
         if self.no_think:
             user_prompt += "\n/no_think"
 
-        # Call LLM
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-            )
-            raw = response.choices[0].message.content.strip()
-        except Exception as e:
-            # API error — fall back to top-1 candidate
-            print(f"  LLM API error for '{mention}': {e}")
-            return DisambiguationResult(
-                mention=mention,
-                mesh_id=candidates[0].mesh_id,
-                preferred_label=candidates[0].preferred_label,
-                chosen_rank=1,
-                confidence="fallback",
-                raw_response=f"ERROR: {e}",
-            )
+        messages = [
+            {"role": "system", "content": self.prompt_config.system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
 
-        # Parse response
-        chosen_idx = _parse_llm_response(raw, len(candidates))
+        # Call LLM with retry on timeout
+        raw = None
+        max_retries = 2
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                )
+                raw = response.choices[0].message.content.strip()
+
+                # Track token usage
+                if hasattr(response, 'usage') and response.usage:
+                    self.total_input_tokens += (
+                        response.usage.prompt_tokens or 0
+                    )
+                    self.total_output_tokens += (
+                        response.usage.completion_tokens or 0
+                    )
+                break
+
+            except Exception as e:
+                err_str = str(e).lower()
+                is_timeout = "timeout" in err_str or "timed out" in err_str
+                if is_timeout and attempt < max_retries:
+                    print(f"  Timeout for '{mention}' "
+                          f"(attempt {attempt}/{max_retries}), retrying...")
+                    time.sleep(2)
+                    continue
+
+                label = "Timeout" if is_timeout else "API error"
+                print(f"  LLM {label} for '{mention}': {e}")
+                return DisambiguationResult(
+                    mention=mention,
+                    mesh_id=candidates[0].mesh_id,
+                    preferred_label=candidates[0].preferred_label,
+                    chosen_rank=1,
+                    confidence="fallback",
+                    raw_response=f"ERROR: {e}",
+                )
+
+        # Parse response using prompt-specific parser
+        chosen_idx = parse_response(self.prompt_config, raw, candidates)
 
         if chosen_idx is not None:
             chosen = candidates[chosen_idx - 1]
@@ -349,7 +249,7 @@ class LLMDisambiguator:
                 raw_response=raw,
             )
         else:
-            # Parse failed or NONE — fall back to top-1
+            # Parse failed — fall back to top-1 (from original ranking)
             return DisambiguationResult(
                 mention=mention,
                 mesh_id=candidates[0].mesh_id,
@@ -359,21 +259,45 @@ class LLMDisambiguator:
                 raw_response=raw,
             )
 
+    # ── Token usage tracking ──────────────────────────────────────────────
+
+    def get_usage_summary(self) -> str:
+        """Return a formatted summary of token usage and estimated cost."""
+        total = self.total_input_tokens + self.total_output_tokens
+        lines = [
+            f"  Token usage:     {self.total_input_tokens:,} input + "
+            f"{self.total_output_tokens:,} output = {total:,} total",
+        ]
+
+        pricing = self._pricing.get(self.model)
+        if pricing:
+            input_price, output_price = pricing
+            cost_in = self.total_input_tokens / 1_000_000 * input_price
+            cost_out = self.total_output_tokens / 1_000_000 * output_price
+            lines.append(
+                f"  Estimated cost:  ${cost_in:.4f} (in) + "
+                f"${cost_out:.4f} (out) = ${cost_in + cost_out:.4f}"
+            )
+        elif total > 0:
+            lines.append(
+                f"  Estimated cost:  unknown (no pricing for '{self.model}')"
+            )
+
+        return "\n".join(lines)
+
+    # ── Batch disambiguation ──────────────────────────────────────────────
+
     def disambiguate_batch(
         self,
         items: list[dict],
         top_k: int = 5,
     ) -> list[DisambiguationResult]:
-        """
-       Uses the disambiguate() method for a batch of mentions.
-        """
+        """Disambiguate a batch of mentions."""
         results = []
         total = len(items)
 
         for i, item in enumerate(items):
-            # Limit candidates to top_k for the LLM
             candidates = item["candidates"][:top_k]
-
             result = self.disambiguate(
                 mention=item["mention"],
                 candidates=candidates,
