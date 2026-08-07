@@ -28,8 +28,52 @@ Usage:
 """
 
 import time
+import json
 import random
 from dataclasses import dataclass
+
+
+# ── Structured-output helpers ──────────────────────────────────────────────
+
+def _build_id_schema(candidates: list) -> dict:
+    """
+    Build an OpenAI-compatible json_schema response_format that constrains
+    mesh_id to exactly the candidate IDs of this request. The model then
+    cannot emit an invalid or hallucinated ID.
+    """
+    ids = list(dict.fromkeys(c.mesh_id for c in candidates))  # unique, ordered
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "entity_link",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "mesh_id": {"type": "string", "enum": ids},
+                },
+                "required": ["mesh_id"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _parse_structured_id(raw: str, candidates: list) -> int | None:
+    """Extract mesh_id from a structured reply, return 1-based candidate index."""
+    try:
+        data = json.loads(raw)
+        mesh_id = str(data.get("mesh_id", ""))
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return None
+    for i, c in enumerate(candidates, 1):
+        if c.mesh_id == mesh_id:
+            return i
+    return None
+
+# >>> SANITY CHECK — uncomment to enable debug output <<<
+# SANITY_DEBUG = True
+SANITY_DEBUG = False
 
 from openai import OpenAI
 
@@ -77,15 +121,28 @@ class LLMDisambiguator:
         prompt_version: str = "v3",
         shuffle_candidates: bool = False,
         shuffle_seed: int | None = None,
+        max_definition_len: int | None = None,
+        structured_output: bool = False,
     ):
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens if not no_think else min(max_tokens, 512)
         self.no_think = no_think
         self.shuffle_candidates = shuffle_candidates
+        # Constrain the LLM output to the actual candidate IDs of THIS request
+        # via a per-request JSON-schema enum. The model then physically cannot
+        # emit an invalid or hallucinated ID, which removes parse fallbacks and
+        # makes the fuzzy text parser unnecessary. Disabled automatically if the
+        # backend rejects the response_format (see disambiguate()).
+        self.structured_output = structured_output
+        self._structured_supported = structured_output
 
         # Load prompt config from registry
         self.prompt_config = get_prompt_config(prompt_version)
+
+        # Override max_definition_len if provided via CLI
+        if max_definition_len is not None:
+            self.prompt_config.max_definition_len = max_definition_len
 
         # Set up shuffling RNG (deterministic if seed is given)
         self._rng = random.Random(shuffle_seed) if shuffle_candidates else None
@@ -138,9 +195,11 @@ class LLMDisambiguator:
             else ", shuffle=random" if self.shuffle_candidates
             else ""
         )
+        struct_label = ", structured=enum" if self.structured_output else ""
         print(f"  LLM: {self.model} | prompt={self.prompt_config.name} "
               f"({self.prompt_config.response_format}) | "
-              f"{think_label}, max_tokens={self.max_tokens}{shuffle_label}")
+              f"{think_label}, max_tokens={self.max_tokens}"
+              f"{shuffle_label}{struct_label}")
 
     # ── Main disambiguation method ────────────────────────────────────────
 
@@ -150,6 +209,8 @@ class LLMDisambiguator:
         candidates: list,
         context: str,
         title: str = "",
+        mention_start: int = -1,
+        dynamic_examples: list | None = None,
     ) -> DisambiguationResult:
         """
         Disambiguate a mention using the LLM.
@@ -166,6 +227,13 @@ class LLMDisambiguator:
             config uses full_context, otherwise a sentence snippet.
         title : str
             Paper title.
+        mention_start : int
+            Character offset of the mention inside `context`. Pass the gold
+            annotation offset so the context window is anchored correctly —
+            a substring search puts it around the wrong position for ~3.4%
+            of mentions, almost all of them abbreviations.
+        dynamic_examples : list[dict] | None
+            Retrieved few-shot examples; replace the hard-coded ones.
         """
         if not candidates:
             return DisambiguationResult(
@@ -181,6 +249,8 @@ class LLMDisambiguator:
         # Build prompt
         user_prompt = build_user_prompt(
             self.prompt_config, mention, candidates, context, title,
+            mention_start=mention_start,
+            dynamic_examples=dynamic_examples,
         )
 
         # Append /no_think for Qwen3.5 models
@@ -192,17 +262,26 @@ class LLMDisambiguator:
             {"role": "user", "content": user_prompt},
         ]
 
+        # Build the per-request response_format that pins mesh_id to the actual
+        # candidate IDs. Rebuilt every call because the candidate set changes.
+        response_format = None
+        if self._structured_supported:
+            response_format = _build_id_schema(candidates)
+
         # Call LLM with retry on timeout
         raw = None
         max_retries = 2
         for attempt in range(1, max_retries + 1):
             try:
-                response = self.client.chat.completions.create(
+                kwargs = dict(
                     model=self.model,
                     messages=messages,
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
                 )
+                if response_format is not None:
+                    kwargs["response_format"] = response_format
+                response = self.client.chat.completions.create(**kwargs)
                 raw = response.choices[0].message.content.strip()
 
                 # Track token usage
@@ -217,6 +296,21 @@ class LLMDisambiguator:
 
             except Exception as e:
                 err_str = str(e).lower()
+
+                # Backend doesn't support the structured response_format:
+                # disable it for the rest of the run and retry this call in
+                # plain-text mode (the text parser still works).
+                if response_format is not None and (
+                    "response_format" in err_str or "json_schema" in err_str
+                    or "schema" in err_str or "not supported" in err_str
+                    or "unsupported" in err_str
+                ):
+                    print(f"  Structured output not supported by backend "
+                          f"({e}). Falling back to text parsing for the run.")
+                    self._structured_supported = False
+                    response_format = None
+                    continue
+
                 is_timeout = "timeout" in err_str or "timed out" in err_str
                 if is_timeout and attempt < max_retries:
                     print(f"  Timeout for '{mention}' "
@@ -235,8 +329,37 @@ class LLMDisambiguator:
                     raw_response=f"ERROR: {e}",
                 )
 
-        # Parse response using prompt-specific parser
-        chosen_idx = parse_response(self.prompt_config, raw, candidates)
+        # Parse response. If structured output was actually used, the reply is
+        # guaranteed-valid JSON with an id from the candidate enum, so match it
+        # directly; otherwise fall back to the prompt-specific text parser.
+        chosen_idx = None
+        if response_format is not None:
+            chosen_idx = _parse_structured_id(raw, candidates)
+        if chosen_idx is None:
+            chosen_idx = parse_response(self.prompt_config, raw, candidates)
+
+        # >>> SANITY CHECK — Phase 4 debug output <<<
+        if SANITY_DEBUG:
+            print(f"\n{'═'*70}")
+            print(f"  PHASE 4 DEBUG: \"{mention}\"")
+            print(f"{'═'*70}")
+            print(f"\n  ── System Prompt ──")
+            print(f"  {self.prompt_config.system_prompt[:300]}...")
+            print(f"\n  ── User Prompt (full) ──")
+            print(f"  {user_prompt}")
+            print(f"\n  ── LLM Raw Response ──")
+            print(f"  {raw}")
+            print(f"\n  ── Parsed Result ──")
+            if chosen_idx is not None:
+                c = candidates[chosen_idx - 1]
+                print(f"  Chosen: #{chosen_idx} {c.mesh_id}"
+                      f" \"{c.preferred_label}\" (confidence: llm)")
+            else:
+                print(f"  PARSE FAILED — fallback to #1"
+                      f" {candidates[0].mesh_id}"
+                      f" \"{candidates[0].preferred_label}\"")
+            print(f"  {'═'*70}\n")
+        # >>> END SANITY CHECK <<<
 
         if chosen_idx is not None:
             chosen = candidates[chosen_idx - 1]

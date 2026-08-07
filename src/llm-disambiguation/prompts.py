@@ -63,8 +63,15 @@ class PromptConfig:
     include_match_score: bool
     allow_none: bool            # True = LLM can answer "NONE"
     ask_reasoning: bool         # True = ask for CoT reasoning before answer
-    max_definition_len: int = 150
+    max_definition_len: int = 1000
     max_synonyms: int = 3
+    include_semantic_type: bool = False  # show MeSH tree-derived semantic type per candidate
+    context_words: int = 0      # >0 = word-based mention window of N words
+                                # (Ye & Mitchell, ACL 2025, found 64 optimal);
+                                # 0 = legacy sentence-based window
+    context_sentences: int = 0  # >0 = sentence-based window: N sentences on each
+                                # side of the mention's sentence. Takes priority
+                                # over context_words. 0 = off.
 
 
 # ── Prompt versions ──────────────────────────────────────────────────────
@@ -241,6 +248,119 @@ Rules:
         ask_reasoning=True,
     ),
 
+    # ── V7: BioLinkerAI replication — simple prompt, semantic types ──────
+    # Replicates BioLinkerAI's prompt style:
+    #   - Short system prompt, no reasoning
+    #   - Candidates listed with SemanticType (from MeSH tree numbers)
+    #   - No synonyms, no match scores
+    #   - Shorter definitions (200 chars)
+    #   - Full abstract context
+    #   - JSON output for reliable parsing
+    "v7": PromptConfig(
+        name="v7",
+        description="BioLinkerAI replication: simple prompt, semantic types, full context, JSON output",
+        system_prompt="""\
+You are a biomedical entity linking expert. Given an entity mention in a biomedical text and a list of candidate concepts, select the best matching candidate.
+
+Consider the description and semantic type of the candidates with respect to the context of the input text to make the decision.
+
+Respond with ONLY a JSON object: {"entity_name": "<name>", "mesh_id": "<id>"}""",
+        response_format="json_entity",
+        use_full_context=True,
+        include_few_shot=False,
+        include_categories=False,
+        include_match_score=False,
+        allow_none=False,
+        ask_reasoning=False,
+        max_definition_len=200,
+        max_synonyms=0,
+        include_semantic_type=True,
+    ),
+
+    # ── V8: literature-informed baseline ─────────────────────────────────
+    # Built from the findings in Ye & Mitchell (ACL 2025) plus our own error
+    # analysis. Differences to v6:
+    #   - no forced chain-of-thought: the simplest prompt beat both CoT and a
+    #     reasoning model across all five datasets in their study, and our own
+    #     degradations are over-specification, which reasoning makes worse
+    #   - 64-word window around the mention (their measured optimum)
+    #   - keeps match scores (Phase 3 ranking is a strong prior)
+    #   - designed to be run with --retrieval-fewshot: the retrieved training
+    #     examples carry the dataset's annotation convention
+    "v8": PromptConfig(
+        name="v8",
+        description="Literature-informed: no CoT, 64-word window, scores, retrieval few-shots",
+        system_prompt="""\
+You are a biomedical entity linking expert. You are given a mention highlighted in its context and a list of candidate concepts, pre-ranked by a domain-specific system.
+
+Select the candidate that best matches the mention in that context.
+
+Two rules that matter more than they look:
+
+1. MATCH THE LEVEL OF SPECIFICITY. Pick the concept at the same granularity as the mention. "anxiety" is Anxiety, not Anxiety Disorders. "kidney injury" is Kidney Diseases, not Acute Kidney Injury. "encephalopathy" is Brain Diseases, not a named specific encephalopathy. Only go more specific when the text explicitly names the specific condition.
+
+2. TRUST THE RANKING. The top-ranked candidate is correct in roughly 80% of cases. Override it only when the context gives you clear evidence for a different candidate — not merely a plausible one.
+
+Respond with ONLY a JSON object, no reasoning, no other text:
+{"entity_name": "<candidate name>", "mesh_id": "<candidate ID>"}
+
+entity_name and mesh_id must be copied exactly from one of the listed candidates.""",
+        response_format="json_entity",
+        use_full_context=False,
+        include_few_shot=True,
+        include_categories=True,
+        include_match_score=True,
+        allow_none=False,
+        ask_reasoning=False,
+        context_words=64,
+    ),
+
+    # ── V6-full: v6 with full abstract context ──────────────────────────
+    # Same as v6 but uses the full abstract instead of 200-char window.
+    # Tests whether more context helps the LLM.
+    "v6-full": PromptConfig(
+        name="v6-full",
+        description="v6 with full abstract context (tests context window effect)",
+        system_prompt="""\
+You are a biomedical entity linking expert. Your task is to link entity mentions in biomedical texts to the correct MeSH (Medical Subject Headings) identifier.
+
+You will be given:
+1. A biomedical text (title and full abstract of a paper)
+2. A highlighted mention (the entity to link) with surrounding context
+3. A list of candidate MeSH entities, pre-ranked by a domain-specific system. Higher match scores indicate stronger matches.
+
+Your job: Select the candidate that best matches the mention IN CONTEXT. Consider:
+- The meaning of the mention in its specific context
+- Whether the candidate's definition fits the usage
+- Synonyms and alternative names
+- The semantic category of the candidate
+
+IMPORTANT — Specificity rule: Always pick the concept at the SAME level of specificity as the mention. If the mention says "anxiety", pick the general concept (Anxiety), NOT a more specific subtype (Anxiety Disorders, Social Anxiety). If the mention says "breast cancer", pick the specific concept, not just "Neoplasms". Only choose a more specific or more general concept if the context explicitly supports it.
+
+IMPORTANT — Trust the ranking: The candidates are pre-ranked by domain rules. The top-ranked candidate (highest match score) is correct in ~80% of cases. Only override it if you have strong contextual evidence that a lower-ranked candidate is a better match.
+
+Think step by step: First, identify what the mention refers to in this context. Then, compare it against the candidates and pick the best match.
+
+Respond with 1-2 sentences of reasoning, then on a NEW LINE output ONLY a JSON object:
+{"entity_name": "<candidate name>", "mesh_id": "<candidate ID>"}
+
+Example response:
+The mention "CF" in the context of lung disease and CFTR mutations refers to cystic fibrosis, not other CF abbreviations.
+{"entity_name": "Cystic Fibrosis", "mesh_id": "D003550"}
+
+Rules:
+- entity_name must EXACTLY match one of the candidate names listed
+- mesh_id must EXACTLY match that candidate's identifier
+- Always end with the JSON object on its own line""",
+        response_format="json_entity",
+        use_full_context=True,
+        include_few_shot=True,
+        include_categories=True,
+        include_match_score=True,
+        allow_none=False,
+        ask_reasoning=True,
+    ),
+
     # ── V4: Best-of-v2+v3 — JSON output, scores, sentence context ──────
     "v4": PromptConfig(
         name="v4",
@@ -317,6 +437,8 @@ def build_user_prompt(
     candidates: list,
     context: str,
     title: str = "",
+    mention_start: int = -1,
+    dynamic_examples: list | None = None,
 ) -> str:
     """
     Build the user prompt for the LLM based on the prompt config.
@@ -334,20 +456,42 @@ def build_user_prompt(
         or a sentence snippet otherwise.
     title : str
         The paper title.
+    mention_start : int
+        Character offset of the mention within `context`. Pass the gold
+        annotation offset when available; -1 triggers a word-boundary search.
+    dynamic_examples : list[dict] | None
+        Retrieved few-shot examples, each {mention, context, label, id}.
+        When given, these replace the hard-coded examples.
     """
     parts = []
 
     # ── Context section ──
+    # With a word-based window we deliberately do NOT dump the surrounding
+    # text as well: the window IS the context, and repeating the abstract
+    # around it reintroduces exactly the noise the window is meant to remove.
     parts.append("## Biomedical Text")
     if title:
         parts.append(f"**Title:** {title}")
 
-    label = "Abstract" if config.use_full_context else "Text"
-    parts.append(f"**{label}:** {context}")
+    bounded = config.context_words > 0 or config.context_sentences > 0
+    if not bounded:
+        label = "Abstract" if config.use_full_context else "Text"
+        parts.append(f"**{label}:** {context}")
     parts.append("")
 
-    # ── Mention with context window (2 sentences before/after) ──
-    mention_window = _extract_mention_window(context, mention, n_sentences=2)
+    # ── Mention with context window ──
+    # Priority: sentence window > word window > legacy 2-sentence window.
+    if config.context_sentences > 0:
+        mention_window = _extract_mention_window(
+            context, mention, n_sentences=config.context_sentences,
+            start=mention_start,
+        )
+    elif config.context_words > 0:
+        mention_window = _extract_word_window(
+            context, mention, n_words=config.context_words, start=mention_start,
+        )
+    else:
+        mention_window = _extract_mention_window(context, mention, n_sentences=2)
     parts.append(f'## Mention to Link: "{mention}"')
     parts.append(f"**Context window:** {mention_window}")
     parts.append("")
@@ -362,8 +506,8 @@ def build_user_prompt(
             line = f"{i}. **{c.preferred_label}** [{c.mesh_id}]"
         parts.append(line)
 
-        # Category from MeSH tree numbers
-        if config.include_categories:
+        # Category from MeSH tree numbers (standard format)
+        if config.include_categories and not config.include_semantic_type:
             tree_numbers = getattr(c, "tree_numbers", [])
             if tree_numbers:
                 cats = sorted({
@@ -372,21 +516,34 @@ def build_user_prompt(
                 })
                 parts.append(f"   Category: {', '.join(cats)}")
 
-        # Definition (truncated)
+        # Semantic type (BioLinkerAI-style, derived from MeSH tree numbers)
+        if config.include_semantic_type:
+            tree_numbers = getattr(c, "tree_numbers", [])
+            if tree_numbers:
+                cats = sorted({
+                    _TREE_CATS.get(tn[0], "")
+                    for tn in tree_numbers if tn
+                })
+                sem_type = ", ".join(c_name for c_name in cats if c_name)
+                if sem_type:
+                    parts.append(f"   Semantic type: {sem_type}")
+
+        # Definition (optionally truncated; 0 = unlimited)
         if c.definition:
             defn = c.definition
-            if len(defn) > config.max_definition_len:
+            if config.max_definition_len > 0 and len(defn) > config.max_definition_len:
                 defn = defn[:config.max_definition_len] + "..."
             parts.append(f"   Definition: {defn}")
 
-        # Synonyms
-        other_syns = [
-            s for s in c.synonyms
-            if s.lower() != c.preferred_label.lower()
-        ]
-        if other_syns:
-            shown = other_syns[:config.max_synonyms]
-            parts.append(f"   Synonyms: {', '.join(shown)}")
+        # Synonyms (skipped when max_synonyms=0)
+        if config.max_synonyms > 0:
+            other_syns = [
+                s for s in c.synonyms
+                if s.lower() != c.preferred_label.lower()
+            ]
+            if other_syns:
+                shown = other_syns[:config.max_synonyms]
+                parts.append(f"   Synonyms: {', '.join(shown)}")
 
         # Match score (optional — hidden in v3 to avoid position bias)
         if config.include_match_score:
@@ -408,7 +565,25 @@ def build_user_prompt(
         )
 
     # ── Few-shot examples ──
-    if config.include_few_shot:
+    # Retrieved examples take priority over the hard-coded ones: they come
+    # from the training split and carry the dataset's ANNOTATION CONVENTION,
+    # which is what most disambiguation errors are actually about (BC5CDR
+    # gold is usually the broader MeSH descriptor, e.g. "encephalopathy" →
+    # Brain Diseases, not a semantically tighter subconcept).
+    if dynamic_examples:
+        parts.append("")
+        parts.append(
+            "Examples from annotated data — note how specific the chosen "
+            "concept is relative to the mention, and follow the same convention:"
+        )
+        for ex in dynamic_examples:
+            target = (
+                f'{ex["label"]} [{ex["id"]}]' if ex.get("label") else f'[{ex["id"]}]'
+            )
+            parts.append(
+                f'- "{ex["mention"]}" in "{ex["context"]}" → {target}'
+            )
+    elif config.include_few_shot:
         parts.append("")
         parts.append("Examples of correct linking:")
         for mention_ex, correct, wrong in _FEW_SHOT_EXAMPLES:
@@ -442,50 +617,111 @@ def parse_response(
         return _parse_number(text, len(candidates), config.allow_none)
 
 
+# Matches a JSON object, tolerating one level of nesting.
+_JSON_OBJ_RE = re.compile(r'\{(?:[^{}]|\{[^{}]*\})*\}')
+
+# Placeholder values from the prompt template — if a model echoes the format
+# spec before answering, we must not mistake the template for the answer.
+_PLACEHOLDER_RE = re.compile(r'^\s*<.*>\s*$')
+
+
+def _normalize_id(raw: str) -> str:
+    """Normalize a MeSH/UMLS id: strip vocabulary prefixes, upper-case."""
+    s = str(raw).strip().upper()
+    for prefix in ("MESH:", "MSH:", "UMLS:", "MESHID:", "ID:"):
+        if s.startswith(prefix):
+            s = s[len(prefix):].strip()
+    return s
+
+
+def _normalize_label(raw: str) -> str:
+    """Normalize an entity label for comparison: lowercase, collapse spaces."""
+    return re.sub(r'\s+', ' ', str(raw).strip().lower())
+
+
 def _parse_json_entity(text: str, candidates: list) -> int | None:
-    """Parse a JSON response like {"entity_name": "...", "mesh_id": "..."}."""
-    # Extract JSON object (handles markdown code blocks, extra text)
-    json_match = re.search(r'\{[^}]+\}', text)
-    if not json_match:
-        return None
+    """
+    Parse a JSON response like {"entity_name": "...", "mesh_id": "..."}.
 
-    try:
-        data = json.loads(json_match.group())
-    except json.JSONDecodeError:
-        return None
+    Scans the response back-to-front: prompt versions that ask for reasoning
+    first (v6, v6-full) put the real answer LAST, and models frequently echo
+    the format template earlier in the response. Taking the first match would
+    return the template and silently fall back to the Phase 3 top-1.
+    """
+    entity_name = mesh_id = ""
 
-    # Validate with Pydantic if available
-    if HAS_PYDANTIC and EntityLinkResponse is not None:
+    for raw in reversed(_JSON_OBJ_RE.findall(text)):
         try:
-            parsed = EntityLinkResponse(**data)
-            entity_name = parsed.entity_name
-            mesh_id = parsed.mesh_id
-        except Exception:
-            entity_name = data.get("entity_name", "")
-            mesh_id = data.get("mesh_id", "")
-    else:
-        entity_name = str(data.get("entity_name", ""))
-        mesh_id = str(data.get("mesh_id", ""))
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+
+        # Validate with Pydantic if available
+        if HAS_PYDANTIC and EntityLinkResponse is not None:
+            try:
+                parsed = EntityLinkResponse(**data)
+                cand_name, cand_id = parsed.entity_name, parsed.mesh_id
+            except Exception:
+                cand_name = data.get("entity_name", "")
+                cand_id = data.get("mesh_id", "")
+        else:
+            cand_name = data.get("entity_name", "")
+            cand_id = data.get("mesh_id", "")
+
+        cand_name, cand_id = str(cand_name or ""), str(cand_id or "")
+
+        # Skip the format template: {"entity_name": "<name>", "mesh_id": "<id>"}
+        if _PLACEHOLDER_RE.match(cand_name) or _PLACEHOLDER_RE.match(cand_id):
+            continue
+        if not cand_name and not cand_id:
+            continue
+
+        entity_name, mesh_id = cand_name, cand_id
+        break
 
     if not entity_name and not mesh_id:
         return None
 
-    # 1) Match by mesh_id (exact)
+    # 1) Exact id match
     for i, c in enumerate(candidates, 1):
         if c.mesh_id == mesh_id:
             return i
 
-    # 2) Match by entity_name (exact, case-insensitive)
-    name_lower = entity_name.lower().strip()
-    for i, c in enumerate(candidates, 1):
-        if c.preferred_label.lower().strip() == name_lower:
-            return i
+    # 2) Normalized id match ("MESH:D003866", "d003866", ...)
+    norm_id = _normalize_id(mesh_id)
+    if norm_id:
+        for i, c in enumerate(candidates, 1):
+            if _normalize_id(c.mesh_id) == norm_id:
+                return i
 
-    # 3) Fuzzy: substring match on entity_name
-    for i, c in enumerate(candidates, 1):
-        label_lower = c.preferred_label.lower()
-        if name_lower in label_lower or label_lower in name_lower:
-            return i
+    # 3) Exact label match (case/whitespace-insensitive)
+    norm_name = _normalize_label(entity_name)
+    if norm_name:
+        for i, c in enumerate(candidates, 1):
+            if _normalize_label(c.preferred_label) == norm_name:
+                return i
+
+        # 4) Label match ignoring punctuation
+        stripped = re.sub(r'[^a-z0-9 ]', '', norm_name)
+        for i, c in enumerate(candidates, 1):
+            if re.sub(r'[^a-z0-9 ]', '', _normalize_label(c.preferred_label)) == stripped:
+                return i
+
+        # 5) Substring fallback — pick the CLOSEST match, not the first one.
+        #    Taking the first match systematically favours whichever candidate
+        #    happens to rank higher, e.g. answering "Depressive Disorder" would
+        #    select "Depressive Disorder, Major" if that sits above it.
+        best_i, best_delta = None, None
+        for i, c in enumerate(candidates, 1):
+            label = _normalize_label(c.preferred_label)
+            if norm_name in label or label in norm_name:
+                delta = abs(len(label) - len(norm_name))
+                if best_delta is None or delta < best_delta:
+                    best_i, best_delta = i, delta
+        if best_i is not None:
+            return best_i
 
     return None
 
@@ -529,34 +765,123 @@ def _parse_number(
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
-def _extract_mention_window(
-    context: str, mention: str, n_sentences: int = 2,
+def find_mention(text: str, mention: str, from_pos: int = 0) -> int:
+    """
+    Find `mention` in `text` on a word boundary. Returns -1 if not found.
+
+    Plain str.find() matches substrings inside longer words — "Cr" inside
+    "increased", "dex" inside "dexamethasone", "AL" inside "renal". Those are
+    overwhelmingly abbreviations, i.e. precisely the mentions whose linking
+    depends on getting the right context.
+
+    Boundaries are alphanumeric-only so that mentions containing punctuation
+    or digits (e.g. "5-FU", "TNF-alpha", "vitamin D3") still match.
+    """
+    if not mention:
+        return -1
+    pattern = (
+        r'(?<![A-Za-z0-9])' + re.escape(mention.strip()) + r'(?![A-Za-z0-9])'
+    )
+    m = re.search(pattern, text[from_pos:], re.IGNORECASE)
+    return from_pos + m.start() if m else -1
+
+
+def _extract_word_window(
+    context: str, mention: str, n_words: int = 64, start: int = -1,
 ) -> str:
     """
-    Extract the sentence containing the mention plus n sentences
-    before and after. The mention is highlighted with **markers**.
+    Take `n_words` around the mention, split evenly left and right.
+
+    This is the window Ye & Mitchell (ACL 2025) measured as optimal for LLM
+    disambiguation — tighter than a full abstract (which adds noise) and
+    wider than a single clause (which loses the disambiguating signal).
+
+    `start` should be the gold annotation offset when available; otherwise
+    the mention is located on a word boundary.
     """
-    sentences = re.split(r'(?<=[.!?])\s+', context.strip())
+    if start is None or start < 0 or not _offset_matches(context, mention, start):
+        start = find_mention(context, mention)
+    if start < 0:
+        start = context.lower().find(mention.lower())
+    if start < 0:
+        return " ".join(context.split()[:n_words])
+
+    half = max(1, n_words // 2)
+    left_words = context[:start].split()[-half:]
+    right_words = context[start + len(mention):].split()[:half]
+    surface = context[start:start + len(mention)]
+
+    return " ".join(left_words + [f"**{surface}**"] + right_words)
+
+
+def _offset_matches(text: str, mention: str, start: int) -> bool:
+    """True if `start` really points at `mention` inside `text`."""
+    if start < 0 or start + len(mention) > len(text):
+        return False
+    return text[start:start + len(mention)].lower() == mention.lower()
+
+
+def _extract_mention_window(
+    context: str, mention: str, n_sentences: int = 2, start: int = -1,
+) -> str:
+    """
+    Extract the sentence containing the mention plus n sentences before and
+    after (so n_sentences=2 => up to 5 sentences). The mention is highlighted
+    with **markers**. `start` is the gold character offset — when given, it
+    pins the correct sentence even for repeated mentions or abbreviations.
+    """
+    context = context.strip()
+    sentences = re.split(r'(?<=[.!?])\s+', context)
     if not sentences:
         return context
 
-    mention_lower = mention.lower()
     mention_idx = None
-    for i, sent in enumerate(sentences):
-        if mention_lower in sent.lower():
-            mention_idx = i
-            break
+
+    # Best: map the gold offset to the sentence that contains it.
+    if (start is not None and 0 <= start < len(context)
+            and context[start:start + len(mention)].lower() == mention.lower()):
+        pos = 0
+        for i, sent in enumerate(sentences):
+            j = context.find(sent, pos)
+            if j < 0:
+                j = pos
+            if j <= start < j + len(sent):
+                mention_idx = i
+                break
+            pos = j + len(sent)
+
+    # Otherwise locate on a WORD BOUNDARY. A plain substring search matches
+    # "dex" inside "dexamethasone" or "AL" inside "renal", which puts the
+    # window around a position where the mention does not actually occur.
+    if mention_idx is None:
+        for i, sent in enumerate(sentences):
+            if find_mention(sent, mention) >= 0:
+                mention_idx = i
+                break
+
+    if mention_idx is None:  # fall back to a loose search
+        for i, sent in enumerate(sentences):
+            if mention.lower() in sent.lower():
+                mention_idx = i
+                break
 
     if mention_idx is None:
         return context.replace(mention, f"**{mention}**", 1)
 
-    start = max(0, mention_idx - n_sentences)
-    end = min(len(sentences), mention_idx + n_sentences + 1)
-    window = " ".join(sentences[start:end])
+    win_start = max(0, mention_idx - n_sentences)
+    win_end = min(len(sentences), mention_idx + n_sentences + 1)
+    win_sents = list(sentences[win_start:win_end])
 
-    idx = window.lower().find(mention_lower)
+    # Highlight the mention inside ITS sentence — not the first occurrence in
+    # the whole window, which for a repeated mention marks the wrong instance.
+    local = mention_idx - win_start
+    sent = win_sents[local]
+    idx = find_mention(sent, mention)
+    if idx < 0:
+        idx = sent.lower().find(mention.lower())
     if idx >= 0:
-        original = window[idx:idx + len(mention)]
-        window = window[:idx] + f"**{original}**" + window[idx + len(mention):]
-
-    return window
+        win_sents[local] = (
+            sent[:idx] + f"**{sent[idx:idx + len(mention)]}**"
+            + sent[idx + len(mention):]
+        )
+    return " ".join(win_sents)

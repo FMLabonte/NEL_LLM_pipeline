@@ -164,6 +164,7 @@ class MeSHIndex:
         enrich_dbpedia: bool = False,
         enrich_umls: str | None = None,
         enrich_mondo: bool = False,
+        enrich_mrdef: str | None = None,
     ):
         """
         Parse MeSH XML file(s) and build the search index.
@@ -187,6 +188,11 @@ class MeSHIndex:
             If True, fetch additional disease synonyms from the MONDO
             ontology. Particularly useful for improving Disease linking.
             Cached after first download (~90MB).
+        enrich_mrdef : str or None
+            Path to MRDEF.RRF file. If provided, enriches entities with
+            definitions from UMLS (NCI, MSH, CSP, etc.). Especially useful
+            for supplementary concepts which have no MeSH scope note.
+            Requires cui_to_mesh_cache.json in the same directory.
         """
         if descriptor_path:
             self._parse_descriptors(descriptor_path)
@@ -202,6 +208,10 @@ class MeSHIndex:
             self._enrich_from_dbpedia()
         if enrich_mondo:
             self._enrich_from_mondo()
+
+        # Enrich definitions from MRDEF (after synonyms, before index build)
+        if enrich_mrdef:
+            self._enrich_definitions_from_mrdef(enrich_mrdef)
 
         # Build the appropriate search index based on backend
         if self.backend == "elasticsearch":
@@ -313,6 +323,103 @@ class MeSHIndex:
                     matched_entities += 1
 
         print(f"  + MONDO: {added_count} synonyms ({matched_entities} entities)")
+
+    def _enrich_definitions_from_mrdef(self, mrdef_path: str):
+        """
+        Add definitions from UMLS MRDEF.RRF to entities that lack one.
+
+        MRDEF contains definitions from 16 sources (NCI, MSH, CSP, GO, HPO, etc.).
+        This is especially valuable for supplementary concepts (C-prefix MeSH IDs)
+        which have NO scope note in the MeSH XML — 324k entities with zero definition.
+
+        For entities that already have a definition, MRDEF is skipped (MeSH scope
+        notes are the primary source). For entities without a definition, the best
+        available MRDEF definition is used, with source priority:
+        MSH > NCI > CSP > PDQ > MEDLINEPLUS > others.
+
+        Parameters
+        ----------
+        mrdef_path : str
+            Path to MRDEF.RRF file (e.g., "Data/UMLS/MRDEF.RRF").
+        """
+        import json
+        from pathlib import Path
+
+        mrdef_dir = Path(mrdef_path).parent
+        cui_cache_path = mrdef_dir / "cui_to_mesh_cache.json"
+
+        if not cui_cache_path.exists():
+            print(f"  ! MRDEF skipped: {cui_cache_path} not found")
+            return
+
+        # Load CUI → MeSH mapping
+        with open(cui_cache_path) as f:
+            cui_to_mesh_raw = json.load(f)
+
+        # Build MeSH → CUI(s) reverse mapping
+        mesh_to_cuis: dict[str, list[str]] = {}
+        for cui, mesh_val in cui_to_mesh_raw.items():
+            mesh_ids = mesh_val if isinstance(mesh_val, list) else [mesh_val]
+            for mid in mesh_ids:
+                if mid not in mesh_to_cuis:
+                    mesh_to_cuis[mid] = []
+                mesh_to_cuis[mid].append(cui)
+
+        # Load MRDEF definitions indexed by CUI
+        cui_defs: dict[str, dict[str, str]] = {}
+        with open(mrdef_path, "r") as f:
+            for line in f:
+                parts = line.strip().split("|")
+                if len(parts) >= 6:
+                    cui, source, defn = parts[0], parts[4], parts[5]
+                    if cui not in cui_defs:
+                        cui_defs[cui] = {}
+                    # Keep the longer definition per source
+                    if source not in cui_defs[cui] or len(defn) > len(cui_defs[cui][source]):
+                        cui_defs[cui][source] = defn
+
+        # Source priority: prefer biomedical sources with clear definitions
+        source_priority = ["MSH", "NCI", "CSP", "PDQ", "MEDLINEPLUS", "CHV",
+                           "HPO", "GO", "SPN", "FMA", "AIR", "MCM"]
+
+        enriched_count = 0
+        supplemented_count = 0
+
+        for mesh_id, entity in self.entities.items():
+            # Only enrich entities that have NO definition
+            if entity.definition:
+                continue
+
+            # Find CUIs for this MeSH entity
+            cuis = mesh_to_cuis.get(mesh_id, [])
+            if not cuis:
+                continue
+
+            # Find the best definition across all CUIs and sources
+            best_def = ""
+            best_source = ""
+            best_priority = len(source_priority) + 1
+
+            for cui in cuis:
+                defs = cui_defs.get(cui, {})
+                for source, defn in defs.items():
+                    try:
+                        priority = source_priority.index(source)
+                    except ValueError:
+                        priority = len(source_priority)  # unknown source = lowest
+
+                    # Prefer higher priority source, or longer definition at same priority
+                    if priority < best_priority or (priority == best_priority and len(defn) > len(best_def)):
+                        best_def = defn
+                        best_source = source
+                        best_priority = priority
+
+            if best_def:
+                entity.definition = best_def
+                enriched_count += 1
+
+        print(f"  + MRDEF definitions: {enriched_count} entities enriched "
+              f"(from {len(cui_defs)} CUIs)")
 
     def _parse_descriptors(self, path: str):
         """Parse MeSH descriptor XML (desc2026.xml)."""

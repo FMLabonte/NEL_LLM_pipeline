@@ -79,6 +79,7 @@ def run_analysis(args):
         enrich_wikidata=False,
         enrich_dbpedia=False,
         enrich_umls=args.umls,
+        enrich_mrdef=getattr(args, "mrdef", None),
     )
 
     retriever = CandidateRetriever(index, top_k=args.top_k)
@@ -607,6 +608,8 @@ if __name__ == "__main__":
     parser.add_argument("--backend", default="rapidfuzz")
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--umls", type=str, default=None)
+    parser.add_argument("--mrdef", type=str, default=None,
+                        help="Path to MRDEF.RRF for definition enrichment")
     parser.add_argument("--mrrel", type=str, default=None)
     parser.add_argument("--no-expansion", action="store_true")
     parser.add_argument("--no-topic-scoring", action="store_true")

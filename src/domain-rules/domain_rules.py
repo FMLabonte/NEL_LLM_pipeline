@@ -7,7 +7,7 @@ Applies domain-specific rules to re-rank candidate entities from Phase 2.
 These rules use biomedical knowledge to boost or penalize candidates
 beyond what string similarity alone can achieve.
 
-Rules implemented (Rules 5-7 from BioLinkerAI, based on [6,15]):
+Rules implemented (Rules 5-7 from BioLinkerAI, based on [6,15], + Rule 8 ours):
 
   Rule 5 — Multi-KG Confidence:
     Candidates found in multiple knowledge graphs (MeSH, Wikidata, DBpedia, UMLS)
@@ -23,6 +23,13 @@ Rules implemented (Rules 5-7 from BioLinkerAI, based on [6,15]):
     Boost candidates whose MeSH definition (scope note) contains keywords from
     the mention or the surrounding context. This helps when the mention text
     doesn't match the candidate name but does match its definition.
+    NOTE: reduced from default 3.0 to 1.5 — was causing worst degradations
+    by boosting broad parent concepts with keyword-rich definitions.
+
+  Rule 8 — Specificity Preference (ours):
+    Prefer more specific MeSH terms (deeper tree numbers) when the mention
+    is multi-word. Counteracts Rule 5 + Rule 7 bias toward broad parent
+    concepts that appear in more KGs and have broader definitions.
 
 Usage:
     from domain_rules import DomainRuleReranker
@@ -41,6 +48,10 @@ Paper reference: Section 3, "Domain-Specific Rules", Table 2 (ablation)
 
 import re
 from dataclasses import dataclass
+
+# >>> SANITY CHECK — uncomment to enable debug output <<<
+# SANITY_DEBUG = True
+SANITY_DEBUG = False
 
 # ── MeSH Tree Number → Semantic Category Mapping ──────────────────────────
 # MeSH descriptors have tree numbers like "C04.588.614" where the first
@@ -126,11 +137,13 @@ class DomainRuleReranker:
     mesh_index : MeSHIndex
         The built MeSH index (used for entity lookups and synonym data).
     rule5_boost : float
-        Score boost per additional KG source for Rule 5 (default: 5.0).
+        Score boost per additional KG source for Rule 5 (default: 2.0).
     rule6_penalty : float
         Score penalty for semantic type mismatch in Rule 6 (default: -30.0).
     rule7_boost : float
-        Score boost for definition keyword overlap in Rule 7 (default: 10.0).
+        Score boost for definition keyword overlap in Rule 7 (default: 1.5).
+    rule8_specificity_boost : float
+        Score boost for specific (deep tree) candidates in Rule 8 (default: 2.0).
     wikidata_synonyms : dict or None
         MeSH ID → list of Wikidata synonyms (to check multi-KG presence).
     dbpedia_synonyms : dict or None
@@ -144,8 +157,9 @@ class DomainRuleReranker:
         mesh_index=None,
         rule5_boost: float = 2.0,
         rule6_penalty: float = -30.0,
-        rule7_boost: float = 3.0,
-        top1_protection_threshold: float = 90.0,
+        rule7_boost: float = 1.5,
+        rule8_specificity_boost: float = 2.0,
+        top1_protection_threshold: float = 75.0,
         wikidata_synonyms: dict | None = None,
         dbpedia_synonyms: dict | None = None,
         umls_synonyms: dict | None = None,
@@ -154,6 +168,7 @@ class DomainRuleReranker:
         self.rule5_boost = rule5_boost
         self.rule6_penalty = rule6_penalty
         self.rule7_boost = rule7_boost
+        self.rule8_specificity_boost = rule8_specificity_boost
         self.top1_protection_threshold = top1_protection_threshold
         self.wikidata_synonyms = wikidata_synonyms or {}
         self.dbpedia_synonyms = dbpedia_synonyms or {}
@@ -190,19 +205,29 @@ class DomainRuleReranker:
         if not candidates:
             return candidates
 
-        # Top-1 protection: if Phase 2 top-1 has a very high score
-        # (near-exact match), don't let rules flip it — the string
-        # match is already highly confident.
+        # Top-1 protection: if Phase 2 top-1 has a high score,
+        # protect it proportionally to its lead over top-2.
         top1_score = candidates[0].score
+        top2_score = candidates[1].score if len(candidates) >= 2 else 0.0
+        score_gap = top1_score - top2_score
         protect_top1 = top1_score >= self.top1_protection_threshold
+
+        # Proportional protection: scales with the Phase 2 score gap.
+        # Big gap (top-1 clearly best) → strong protection.
+        # Small gap (close race) → less protection, let rules decide.
+        if protect_top1:
+            protection_bonus = min(max(score_gap * 0.5, 3.0), 20.0)
+        else:
+            protection_bonus = 0.0
+
+        # Determine if mention is specific (multi-word → likely specific)
+        mention_word_count = len(mention.strip().split())
 
         scored = []
         for i, c in enumerate(candidates):
             adjustments = {}
 
             # Rule 5: Multi-KG confidence boost
-            # Only apply as a relative signal: boost difference between
-            # candidates, not absolute (to avoid uniform shift)
             r5 = self._rule5_multi_kg_confidence(c.mesh_id)
             adjustments["rule5"] = r5
 
@@ -214,14 +239,16 @@ class DomainRuleReranker:
             r7 = self._rule7_definition_overlap(c, mention, context)
             adjustments["rule7"] = r7
 
+            # Rule 8: Specificity preference
+            r8 = self._rule8_specificity(c, mention_word_count)
+            adjustments["rule8"] = r8
+
             # Combined score
             total_adjustment = sum(adjustments.values())
 
-            # Top-1 protection: if protecting, give top-1 candidate
-            # a bonus equal to the max possible rule adjustment,
-            # so rules can only flip top-1 if they strongly disagree
+            # Top-1 protection: proportional bonus for Phase 2 top-1
             if protect_top1 and i == 0:
-                total_adjustment += 15.0  # protection bonus
+                total_adjustment += protection_bonus
 
             new_score = c.score + total_adjustment
 
@@ -230,11 +257,44 @@ class DomainRuleReranker:
         # Sort by new score (descending)
         scored.sort(key=lambda x: x[1], reverse=True)
 
+        # >>> SANITY CHECK — Phase 3 debug output <<<
+        if SANITY_DEBUG:
+            print(f"\n{'═'*70}")
+            print(f"  PHASE 3 DEBUG: \"{mention}\"")
+            print(f"{'═'*70}")
+            print(f"  Entity type: {entity_type}")
+            print(f"  Top-1 protection: {'YES' if protect_top1 else 'NO'}"
+                  f" (top1={top1_score:.1f}, top2={top2_score:.1f},"
+                  f" gap={score_gap:.1f}, bonus={protection_bonus:.1f})")
+            print(f"  Mention word count: {mention_word_count}")
+            print(f"\n  {'─'*66}")
+            print(f"  Candidates after re-ranking (top 10):")
+            print(f"  {'#':<4} {'MeSH ID':<12} {'Name':<35} {'Orig':>6}"
+                  f" {'R5':>5} {'R6':>6} {'R7':>5} {'R8':>5} {'Prot':>5}"
+                  f" {'New':>7}")
+            print(f"  {'─'*100}")
+            for rank, (c, new_score, adj) in enumerate(scored[:10], 1):
+                orig = new_score - sum(adj.values())
+                if protect_top1 and candidates[0].mesh_id == c.mesh_id:
+                    orig -= protection_bonus
+                prot_str = f"+{protection_bonus:.1f}" if (
+                    protect_top1 and candidates[0].mesh_id == c.mesh_id
+                ) else "0.0"
+                name = (c.preferred_label or "")[:34]
+                print(f"  {rank:<4} {c.mesh_id:<12} {name:<35}"
+                      f" {orig:>6.1f}"
+                      f" {adj['rule5']:>+5.1f}"
+                      f" {adj['rule6']:>+6.1f}"
+                      f" {adj['rule7']:>+5.1f}"
+                      f" {adj['rule8']:>+5.1f}"
+                      f" {prot_str:>5}"
+                      f" {new_score:>7.1f}")
+            print(f"  {'═'*70}\n")
+        # >>> END SANITY CHECK <<<
+
         # Update candidate scores and return
         reranked = []
         for c, new_score, _ in scored:
-            # Create a copy-like approach: we modify score in place
-            # (CandidateEntity is a dataclass, so this is fine)
             c.score = new_score
             reranked.append(c)
 
@@ -254,13 +314,18 @@ class DomainRuleReranker:
         -------
         list[dict]
             Each dict has: candidate, original_score, new_score,
-            rule5, rule6, rule7 adjustments.
+            rule5, rule6, rule7, rule8 adjustments.
         """
         if not candidates:
             return []
 
         top1_score = candidates[0].score
+        top2_score = candidates[1].score if len(candidates) >= 2 else 0.0
+        score_gap = top1_score - top2_score
         protect_top1 = top1_score >= self.top1_protection_threshold
+        protection_bonus = min(max(score_gap * 0.5, 3.0), 20.0) if protect_top1 else 0.0
+
+        mention_word_count = len(mention.strip().split())
 
         results = []
         for i, c in enumerate(candidates):
@@ -269,9 +334,10 @@ class DomainRuleReranker:
             r5 = self._rule5_multi_kg_confidence(c.mesh_id)
             r6 = self._rule6_semantic_type(c, entity_type)
             r7 = self._rule7_definition_overlap(c, mention, context)
-            adjustment = r5 + r6 + r7
+            r8 = self._rule8_specificity(c, mention_word_count)
+            adjustment = r5 + r6 + r7 + r8
             if protect_top1 and i == 0:
-                adjustment += 15.0
+                adjustment += protection_bonus
 
             new_score = original_score + adjustment
 
@@ -282,6 +348,7 @@ class DomainRuleReranker:
                 "rule5_boost": r5,
                 "rule6_penalty": r6,
                 "rule7_boost": r7,
+                "rule8_specificity": r8,
             })
 
         results.sort(key=lambda x: x["new_score"], reverse=True)
@@ -404,6 +471,58 @@ class DomainRuleReranker:
         boost = min(boost, self.rule7_boost * 3)
 
         return boost
+
+    # ── Rule 8: Specificity Preference ─────────────────────────────────
+
+    def _rule8_specificity(self, candidate, mention_word_count: int) -> float:
+        """
+        Rule 8: Prefer more specific (deeper) MeSH concepts.
+
+        Parent concepts get unfairly boosted by Rule 5 (more KG sources)
+        and Rule 7 (broader definitions match more keywords). This rule
+        counteracts that by giving a small boost to more specific terms.
+
+        Logic:
+        - Compute tree depth from MeSH tree numbers (e.g., C04.588 = depth 2)
+        - Multi-word mentions are likely specific → boost deeper candidates
+        - Single-word mentions are ambiguous → smaller boost
+
+        Returns
+        -------
+        float
+            Score adjustment (>= 0).
+        """
+        tree_numbers = getattr(candidate, "tree_numbers", [])
+        if not tree_numbers:
+            return 0.0
+
+        # Max tree depth across all tree numbers for this candidate
+        # "C04.588.614.250" → depth 4 (count dots + 1, minus 1 for root)
+        max_depth = 0
+        for tn in tree_numbers:
+            depth = tn.count(".")
+            max_depth = max(max_depth, depth)
+
+        # Scale boost by mention specificity:
+        # 1-word mention → minimal boost (could be generic)
+        # 2-word mention → moderate boost
+        # 3+ word mention → full boost (likely very specific)
+        if mention_word_count <= 1:
+            specificity_factor = 0.3
+        elif mention_word_count == 2:
+            specificity_factor = 0.7
+        else:
+            specificity_factor = 1.0
+
+        # Boost scales with tree depth (deeper = more specific)
+        # depth 0-1: no boost (too generic)
+        # depth 2: small boost
+        # depth 3+: full boost
+        if max_depth <= 1:
+            return 0.0
+
+        depth_factor = min((max_depth - 1) * 0.5, 1.5)
+        return depth_factor * specificity_factor * self.rule8_specificity_boost
 
 
 
