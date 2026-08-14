@@ -33,6 +33,7 @@ import sys
 import re
 import time
 import json
+import difflib
 import argparse
 from pathlib import Path
 
@@ -1103,8 +1104,18 @@ def run_evaluation(args):
         #     print(f"  {'#'*70}\n")
         # >>> END SANITY CHECK <<<
 
-        # Per-mention prediction record (for paired McNemar across runs)
+        # Per-mention prediction record (McNemar + decomposition analysis).
+        # The extra fields let us stratify the LLM's contribution by retriever
+        # confidence, mention difficulty, and gold rank (see analyze_decomposition.py).
         if pred_fh is not None:
+            p3_label = reranked[0].preferred_label if reranked else ""
+            surf = (difflib.SequenceMatcher(
+                None, mention.lower(), p3_label.lower()).ratio() * 100
+            ) if p3_label else 0.0
+            gold_rank_full = next(
+                (i + 1 for i, c in enumerate(reranked)
+                 if c.mesh_id in expanded_gold_ids), -1
+            )
             pred_fh.write(json.dumps({
                 "pmid": pmid,
                 "mention": mention,
@@ -1112,6 +1123,15 @@ def run_evaluation(args):
                 "entity_type": entity_type,
                 "p3_correct": bool(p3_hit),
                 "p4_correct": bool(p4_hit),
+                # decomposition fields
+                "p3_top1": p3_top1,
+                "p4_top1": p4_top1,
+                "llm_changed": bool(p4_top1 != p3_top1),
+                "p3_score_gap": round(p3_score_gap, 2),   # retriever confidence
+                "p3_top1_score": round(reranked[0].score, 2) if reranked else 0.0,
+                "gold_in_list": bool(gold_in_llm_list),
+                "gold_rank": gold_rank_full,              # -1 if not retrieved
+                "surface_sim": round(surf, 1),            # mention vs top-1 label
             }, ensure_ascii=False) + "\n")
 
         # ── Track results ──
