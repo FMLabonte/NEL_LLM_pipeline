@@ -61,16 +61,22 @@ def acc(rows, field="p4_correct"):
 
 
 def stratum_line(name, rows):
-    """One row: n, Phase-3 acc, Phase-4 acc, delta, fixes/breaks."""
+    """One row: n, Phase-3 acc, Phase-4 acc, delta, fixes/breaks, precision.
+
+    Intervention precision = fixes / (fixes + breaks): when the LLM changes the
+    outcome, how often is it an improvement? This is the memorization tell —
+    high on seen concepts, low on unseen.
+    """
     if not rows:
         return f"  {name:22s}  n=0"
     p3 = acc(rows, "p3_correct")
     p4 = acc(rows, "p4_correct")
     fixes = sum(1 for r in rows if r.get("p4_correct") and not r.get("p3_correct"))
     breaks = sum(1 for r in rows if r.get("p3_correct") and not r.get("p4_correct"))
+    prec = f"prec {fixes/(fixes+breaks)*100:4.0f}%" if (fixes + breaks) else "prec   - "
     return (f"  {name:22s}  n={len(rows):5d}  "
             f"P3 {p3:5.1f}%  P4 {p4:5.1f}%  Δ {p4-p3:+5.1f}  "
-            f"(+{fixes}/-{breaks})")
+            f"(+{fixes}/-{breaks}) {prec}")
 
 
 def show_bins(rows, key, edges, labels):
@@ -83,13 +89,59 @@ def show_bins(rows, key, edges, labels):
         print(stratum_line(lab, sub))
 
 
+def confidence_gate(rows):
+    """
+    Simulate calling the LLM only when the retriever is unsure (gap < T):
+    for gap >= T keep Phase 3, for gap < T use Phase 4. Report how many LLM
+    calls that costs and how much of the net benefit it captures — the
+    actionable "80% of the gain for 20% of the compute" result.
+    """
+    have = [r for r in rows if r.get("p3_score_gap") is not None]
+    if not have:
+        print("    (needs p3_score_gap — enriched --dump-predictions)")
+        return
+    n = len(have)
+    p3_acc = sum(bool(r["p3_correct"]) for r in have)
+    p4_acc = sum(bool(r["p4_correct"]) for r in have)
+    full_gain = p4_acc - p3_acc
+    print(f"  {'threshold':>10} {'LLM calls':>12} {'accuracy':>9} {'gain kept':>10}")
+    for t in [2, 5, 10, 20, 1e9]:
+        calls = sum(1 for r in have if r["p3_score_gap"] < t)
+        # correct = P4 where gap<T, else P3
+        correct = sum(
+            bool(r["p4_correct"]) if r["p3_score_gap"] < t else bool(r["p3_correct"])
+            for r in have
+        )
+        gain = correct - p3_acc
+        kept = f"{gain/full_gain*100:.0f}%" if full_gain else "-"
+        label = f"gap<{t:g}" if t < 1e8 else "all (gap<inf)"
+        print(f"  {label:>10} {calls:6d} ({calls/n*100:4.1f}%) "
+              f"{correct/n*100:8.1f}% {kept:>10}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("preds")
     ap.add_argument("--train", default=None, help="train JSONL for seen/unseen")
+    ap.add_argument("--dedup", action="store_true",
+                    help="Collapse duplicate (mention, gold_id) pairs first "
+                         "(Tutubalina et al.: official test sets over-count via "
+                         "repeated mention strings). Report both with/without.")
+    ap.add_argument("--tokens", type=int, default=None,
+                    help="Total token count from the run's RESULTS block; prints "
+                         "tokens per net fix (cost of the disambiguation stage).")
     args = ap.parse_args()
 
     rows = load(args.preds)
+    if args.dedup:
+        seen_keys, deduped = set(), []
+        for r in rows:
+            k = (str(r.get("mention", "")).lower(), str(r.get("gold_id", "")))
+            if k not in seen_keys:
+                seen_keys.add(k)
+                deduped.append(r)
+        print(f"(dedup: {len(rows)} -> {len(deduped)} unique (mention, gold) pairs)")
+        rows = deduped
     n = len(rows)
     has_rich = "llm_changed" in rows[0] if rows else False
 
@@ -142,14 +194,28 @@ def main():
         print(stratum_line("gold in list", [r for r in rows if r.get("gold_in_list")]))
         print(stratum_line("gold NOT in list", [r for r in rows if not r.get("gold_in_list")]))
 
-    # ── Seen vs unseen ──
+    # ── Seen vs unseen (with intervention precision) ──
     if args.train:
         tg = train_golds(args.train)
         seen = [r for r in rows if any(g in tg for g in str(r["gold_id"]).split("|"))]
         unseen = [r for r in rows if not any(g in tg for g in str(r["gold_id"]).split("|"))]
         print(f"\n── Seen vs unseen concept (train has {len(tg)} concepts) ──")
+        print("   watch the precision column: high on seen + low on unseen = memorization")
         print(stratum_line("seen", seen))
         print(stratum_line("unseen", unseen))
+
+    # ── Confidence gate (actionable: how much gain for how little compute) ──
+    print(f"\n── Confidence gate: call LLM only when Phase-3 gap < threshold ──")
+    confidence_gate(rows)
+
+    # ── Cost per fix ──
+    if args.tokens is not None:
+        net = (sum(bool(r.get("p4_correct")) for r in rows)
+               - sum(bool(r.get("p3_correct")) for r in rows))
+        if net > 0:
+            print(f"\n── Cost ──")
+            print(f"  {args.tokens:,} tokens / {net} net fixes = "
+                  f"{args.tokens/net:,.0f} tokens per corrected mention")
 
     print()
 

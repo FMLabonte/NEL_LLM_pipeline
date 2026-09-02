@@ -36,7 +36,7 @@ import torch
 from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig,
-    EarlyStoppingCallback,
+    EarlyStoppingCallback, set_seed,
 )
 from peft import LoraConfig, PeftModel
 from trl import SFTConfig, SFTTrainer, DataCollatorForCompletionOnlyLM
@@ -76,10 +76,18 @@ def main():
                          "(~5k) makes each eval take ~8 min — a representative "
                          "subset is enough for the early-stopping signal. Final, "
                          "proper evaluation is done separately via evaluate_pipeline.")
+    ap.add_argument("--seed", type=int, default=42,
+                    help="Seed for weight init, data order and shuffling. Vary it "
+                         "to measure how much of a fine-tuning effect is run-to-run "
+                         "noise; the paper reports three seeds.")
     ap.add_argument("--merge", action="store_true",
                     help="After training, also save a merged full model for "
                          "serving (only without --load-in-4bit).")
     args = ap.parse_args()
+    # Seeds python, numpy and torch before anything touches a generator, so a
+    # run is reproducible from the command line alone.
+    set_seed(args.seed)
+    print(f"seed = {args.seed}")
 
     tok = AutoTokenizer.from_pretrained(args.model)
     if tok.pad_token is None:
@@ -141,6 +149,7 @@ def main():
         max_seq_length=args.max_seq_len,        # [TRL] older TRL: max_length
         dataset_text_field="text",
         packing=False, report_to="none",
+        seed=args.seed, data_seed=args.seed,
     )
 
     trainer = SFTTrainer(

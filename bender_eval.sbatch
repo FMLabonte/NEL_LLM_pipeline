@@ -8,9 +8,9 @@
 # Modell/Datensatz unten anpassen, dann:  sbatch bender_eval.sbatch
 # ==========================================================================
 #SBATCH --job-name=nel-eval
-#SBATCH --partition=A100short      # 80GB: vLLM + SapBERT teilen sich die GPU bequem
-#SBATCH --gpus=1
-#SBATCH --time=04:00:00
+#SBATCH --partition=A40short       # A40 = Intel (wie Login/eval_env); A100 ist AMD
+#SBATCH --gpus=1                   #   -> auf A100 "Illegal instruction". Bei A40 bleiben!
+#SBATCH --time=08:00:00
 #SBATCH --output=logs/eval-%j.out
 
 set -e
@@ -25,6 +25,7 @@ PORT=8000
 # ───────────────────────────────────────────────────────────────────────────
 
 module load Python
+module load CUDA                    # vLLM/flashinfer braucht nvcc zur Laufzeit!
 source ~/NEL_LLM_pipeline/eval_env/bin/activate
 cd ~/NEL_LLM_pipeline
 export TOKENIZERS_PARALLELISM=false
@@ -52,6 +53,7 @@ python3 src/evaluate_pipeline.py --model "$SERVED_NAME" \
     --base-url "http://localhost:$PORT/v1" --api-key dummy \
     --wikidata --dbpedia --umls Data/UMLS/MRCONSO.RRF --embedding \
     --llm-top-k 10 --prompt-version v8 --dataset "$DATASET" --temperature 0 \
+    --max-tokens 256 \
     --structured-output --keep-duplicates --dump-predictions "$OUT"
 
 # ── vLLM beenden ──

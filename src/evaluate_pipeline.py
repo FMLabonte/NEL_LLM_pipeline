@@ -65,11 +65,18 @@ from string_normalizer import generate_variants
 from document_topic_scorer import DocumentTopicScorer
 
 try:
-    from embedding_retriever import EmbeddingRetriever, MultiEmbeddingRetriever
+    from embedding_retriever import (EmbeddingRetriever, MultiEmbeddingRetriever,
+                                      UMLSEmbeddingRetriever)
     from hybrid_scorer import HybridScorer
     HAS_EMBEDDING = True
 except ImportError:
     HAS_EMBEDDING = False
+
+try:
+    from bm25_retriever import BM25Retriever
+    HAS_BM25 = True
+except ImportError:
+    HAS_BM25 = False
 
 try:
     from llm_abbreviation_expander import LLMAbbreviationExpander
@@ -149,6 +156,81 @@ def extract_sentence(text: str, mention: str, start: int = -1, window: int = 200
     return snippet.strip()
 
 
+def _load_external_candidates(path):
+    """Load an external retriever's candidate lists (BioSyn/ArboEL adapter).
+
+    Expects JSONL, one record per mention:
+        {"pmid": "...", "start": 123, "mention": "...",
+         "candidates": [{"cui": "D000001", "name": "Foo", "score": 0.98}, ...]}
+    Returns a dict with two lookups so mentions match whether or not the
+    external tool preserved character offsets:
+        by_offset[(pmid, start)] -> candidates
+        by_text[(pmid, mention_lower)] -> candidates   (fallback)
+    """
+    import json
+    by_offset, by_text = {}, {}
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            pmid = str(rec.get("pmid", ""))
+            cands = rec.get("candidates", []) or []
+            try:
+                start = int(rec.get("start", -1))
+            except (TypeError, ValueError):
+                start = -1
+            if start >= 0:
+                by_offset[(pmid, start)] = cands
+            mention = (rec.get("mention") or "").lower().strip()
+            if mention:
+                by_text.setdefault((pmid, mention), cands)
+    return {"by_offset": by_offset, "by_text": by_text}
+
+
+def _external_to_candidate_entities(cands, mesh_index):
+    """Turn external {cui,name,score} records into CandidateEntity objects.
+
+    Enriches synonyms/definition/tree_numbers from our MeSH index where the CUI
+    is known (so the LLM prompt gets definitions); falls back to a name-only
+    candidate otherwise. Preserves the external ranking order.
+    """
+    from mesh_index import CandidateEntity
+    out = []
+    for c in cands:
+        cui = str(c.get("cui") or c.get("mesh_id") or "").strip()
+        if not cui:
+            continue
+        name = c.get("name") or c.get("preferred_label") or ""
+        try:
+            score = float(c.get("score", 0.0))
+        except (TypeError, ValueError):
+            score = 0.0
+        ent = mesh_index.entities.get(cui) if mesh_index is not None else None
+        if ent is not None:
+            out.append(CandidateEntity(
+                mesh_id=cui,
+                preferred_label=ent.preferred_label or name,
+                synonyms=ent.synonyms,
+                definition=ent.definition,
+                tree_numbers=ent.tree_numbers,
+                score=score,
+                matched_synonym=name,
+            ))
+        else:
+            out.append(CandidateEntity(
+                mesh_id=cui,
+                preferred_label=name,
+                synonyms=[],
+                definition="",
+                tree_numbers=[],
+                score=score,
+                matched_synonym=name,
+            ))
+    return out
+
+
 def run_evaluation(args):
     """Run full pipeline evaluation."""
 
@@ -206,12 +288,16 @@ def run_evaluation(args):
         umls_bridge = None
         mrconso = args.umls or str(PROJECT_ROOT / "Data" / "UMLS" / "MRCONSO.RRF")
         mrrel = args.mrrel or str(PROJECT_ROOT / "Data" / "UMLS" / "MRREL.RRF")
-        if Path(mrrel).exists() and Path(mrconso).exists():
+        # build_bridge() loads umls_bridge_cache.json first if present and never
+        # touches the raw MRREL/MRCONSO in that case — so accept the cache alone
+        # (avoids needing the 16GB raw files on the cluster).
+        bridge_cache = (PROJECT_ROOT / "src" / "candidate-generation"
+                        / "cache" / "umls_bridge_cache.json")
+        if bridge_cache.exists() or (Path(mrrel).exists() and Path(mrconso).exists()):
             umls_bridge = UMLSRelationExpander(mrconso, mrrel)
             umls_bridge.build_bridge()
-            pass  # UMLS bridge loaded
         else:
-            pass  # UMLS bridge files not found
+            pass  # UMLS bridge files/cache not found
 
         expander = CandidateExpander(
             mesh_index_for_rules, retriever, umls_bridge=umls_bridge,
@@ -294,7 +380,18 @@ def run_evaluation(args):
 
     # ── Step 4c: Embedding Retriever (optional) ──
     emb_retriever = None
-    if args.embedding and HAS_EMBEDDING:
+    if args.embedding and HAS_EMBEDDING and args.umls_index and umls_idx is not None:
+        # MedMentions: encode the UMLS concept space (not MeSH). ~3.65M labels,
+        # cached under a separate dir. First build ~20-30 min on GPU.
+        cache_dir = str(PROJECT_ROOT / "src" / "improvements" / "cache" /
+                        "faiss_umls" / args.embedding_model.replace("/", "_"))
+        emb_retriever = UMLSEmbeddingRetriever(
+            umls_index=umls_idx,
+            model_name=args.embedding_model,
+            batch_size=args.embedding_batch_size,
+        )
+        emb_retriever.build_or_load(cache_dir)
+    elif args.embedding and HAS_EMBEDDING:
         cache_dir = str(PROJECT_ROOT / "src" / "improvements" / "cache" / "faiss")
         # Embedding retriever always uses MeSH index (for FAISS label encoding)
         emb_index = mesh_index_for_rules
@@ -320,6 +417,22 @@ def run_evaluation(args):
             emb_retriever.build_or_load(cache_dir)
     elif args.embedding and not HAS_EMBEDDING:
         print("  Warning: embedding retriever unavailable (pip install torch transformers faiss-cpu)")
+
+    # ── Step 4c-bis: Standalone BM25 retriever (named lexical curve point) ──
+    bm25_retriever = None
+    if args.bm25_only:
+        if not HAS_BM25:
+            raise SystemExit("--bm25-only requires rank_bm25 (pip install rank_bm25).")
+        cache_dir = str(PROJECT_ROOT / "src" / "improvements" / "cache" / "bm25")
+        bm25_retriever = BM25Retriever(mesh_index_for_rules)
+        bm25_retriever.build_or_load(cache_dir)
+
+    # ── Step 4c-ter: External candidate lists (BioSyn/ArboEL adapter) ──
+    external_cands = None
+    if args.candidates_from:
+        external_cands = _load_external_candidates(args.candidates_from)
+        print(f"  External candidates loaded: {len(external_cands):,} mention keys "
+              f"from {args.candidates_from}")
 
     # ── Step 4d: Hybrid Scorer (created alongside embedding retriever) ──
     hybrid_scorer = None
@@ -411,10 +524,43 @@ def run_evaluation(args):
         data_path = str(PROJECT_ROOT / "Data" / "BioRED" / "Test.PubTator")
     elif args.dataset == "medmentions":
         data_path = str(PROJECT_ROOT / "Data" / "MedMention" / "MedMentions_st21pv_pubtator.txt")
+    elif args.dataset == "ncbi":
+        # NCBI-Disease corpus (PubTator), disease mentions linked to MEDIC (MeSH+OMIM)
+        split_map = {"train": "trainset", "dev": "developset", "test": "testset"}
+        data_path = str(PROJECT_ROOT / "Data" / "NCBI" / f"NCBI{split_map.get(args.split, 'testset')}_corpus.txt")
+    elif args.dataset == "nlm_chem":
+        # NLM-Chem test set as PubTator, chemical mentions linked to MeSH
+        split_map = {"train": "train", "dev": "dev", "test": "test"}
+        data_path = str(PROJECT_ROOT / "Data" / "NLM-Chem" / f"nlm_chem_{split_map.get(args.split, 'test')}.pubtator")
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
 
     meta, anns, rels = parse_pubtator(data_path)
+
+    # MedMentions ships as ONE combined corpus; restrict to the requested
+    # official ST21pv split so we never evaluate on a train+dev+test mix.
+    # Split PMID lists (same for full & st21pv) live in Data/MedMention/.
+    if args.dataset == "medmentions":
+        split_file_map = {
+            "train": "corpus_pubtator_pmids_trng.txt",
+            "dev": "corpus_pubtator_pmids_dev.txt",
+            "test": "corpus_pubtator_pmids_test.txt",
+        }
+        split_fname = split_file_map.get(args.split, "corpus_pubtator_pmids_test.txt")
+        split_path = PROJECT_ROOT / "Data" / "MedMention" / split_fname
+        if split_path.exists():
+            split_pmids = {ln.strip() for ln in open(split_path) if ln.strip()}
+            before_docs = meta["pmid"].nunique()
+            meta = meta[meta["pmid"].astype(str).isin(split_pmids)].copy()
+            anns = anns[anns["pmid"].astype(str).isin(split_pmids)].copy()
+            if rels is not None and len(rels):
+                rels = rels[rels["pmid"].astype(str).isin(split_pmids)].copy()
+            print(f"  MedMentions {args.split} split: {meta['pmid'].nunique()}/{before_docs} docs "
+                  f"({len(split_pmids)} PMIDs listed), {len(anns)} annotations")
+        else:
+            print(f"  !! WARNING: split file '{split_path.name}' not found — evaluating on the "
+                  f"FULL combined corpus (train+dev+test MIXED). Download the official PMID "
+                  f"lists into Data/MedMention/ to get a clean {args.split} number.")
 
     # Build context lookup
     context_lookup = {}
@@ -444,6 +590,20 @@ def run_evaluation(args):
         skipped = len(eval_df) - mesh_mask.sum()
         eval_df = eval_df[mesh_mask]
         print(f"  Filtered to MeSH-linkable: {len(eval_df)} (skipped {skipped})")
+
+    elif args.dataset in ("ncbi", "nlm_chem"):
+        # NCBI-Disease (MEDIC) / NLM-Chem (MeSH): golds like "MESH:D009369",
+        # "OMIM:12345", or composite mentions "D1|D2" / "D1+D2". Normalise to bare
+        # MeSH ids (strip the vocabulary prefix, unify the composite separator) and
+        # keep only MeSH-linkable ones (drop OMIM/other so we compare like-for-like).
+        eval_df["mesh_id"] = (eval_df["mesh_id"].astype(str)
+                              .str.replace("MESH:", "", regex=False)
+                              .str.replace("MeSH:", "", regex=False)
+                              .str.replace("+", "|", regex=False))
+        mesh_mask = eval_df["mesh_id"].str.match(r'^[DC]\d+', na=False)
+        skipped = len(eval_df) - mesh_mask.sum()
+        eval_df = eval_df[mesh_mask]
+        print(f"  {args.dataset} filtered to MeSH-linkable: {len(eval_df)} (skipped {skipped})")
 
     elif args.dataset == "medmentions":
         # MedMentions uses UMLS CUI format "UMLS:C0010674"
@@ -518,11 +678,42 @@ def run_evaluation(args):
     n_unique_pairs = eval_df.drop_duplicates(subset=["mention", "mesh_id"]).shape[0]
 
     if args.limit:
+        if getattr(args, "limit_random", False):
+            # Representative random subset (fixed seed) instead of the first N
+            # rows — important for large corpora like MedMentions where head(N)
+            # would only cover the first ~130 documents.
+            eval_df = (eval_df.sample(frac=1, random_state=args.limit_seed)
+                              .reset_index(drop=True))
         eval_df = eval_df.head(args.limit)
 
     n_pairs = len(eval_df)
     print(f"  Evaluating {n_pairs} mention-entity pairs"
-          + (f" (limited to {args.limit})" if args.limit else ""))
+          + (f" (limited to {args.limit}"
+             + (", random" if getattr(args, "limit_random", False) else "")
+             + ")" if args.limit else ""))
+
+    # ── Optional: dump the exact eval mention set and exit ──
+    # Guarantees an external retriever (BioSyn/ArboEL) runs on byte-identical
+    # mentions/offsets, so --candidates-from lookups always align.
+    if getattr(args, "dump_mentions", None):
+        import json as _json
+        outp = Path(args.dump_mentions)
+        outp.parent.mkdir(parents=True, exist_ok=True)
+        with open(outp, "w") as fh:
+            for _, row in eval_df.iterrows():
+                try:
+                    start = int(row["start"])
+                except (KeyError, TypeError, ValueError):
+                    start = -1
+                fh.write(_json.dumps({
+                    "pmid": str(row["pmid"]),
+                    "start": start,
+                    "mention": row["mention"],
+                    "gold": row["mesh_id"],
+                    "entity_type": row.get("entity_type", None),
+                }) + "\n")
+        print(f"  Dumped {n_pairs} eval mentions -> {outp}. Exiting (no evaluation).")
+        return
 
     # ── Step 5b: Retrieval-based few-shot examples (optional) ──
     #
@@ -671,6 +862,13 @@ def run_evaluation(args):
         pp.parent.mkdir(parents=True, exist_ok=True)
         pred_fh = open(pp, "w")
 
+    # Post-P3 candidate dump (offline re-rankers: cross-encoder baseline)
+    cand_fh = None
+    if getattr(args, "dump_candidates", None):
+        cp = Path(args.dump_candidates)
+        cp.parent.mkdir(parents=True, exist_ok=True)
+        cand_fh = open(cp, "w")
+
     t0 = time.time()
 
     for _, row in eval_df.iterrows():
@@ -744,8 +942,20 @@ def run_evaluation(args):
 
         # ── Phase 2: Retrieve candidates ──
         # Search original mention + normalized variants
-        candidates = retriever.retrieve(mention, top_k=args.top_k)
-        if not args.no_string_normalization:
+        if args.candidates_from:
+            # External retriever (BioSyn/ArboEL): candidates come from a file.
+            ext = external_cands["by_offset"].get((str(pmid), mention_start))
+            if ext is None:
+                ext = external_cands["by_text"].get(
+                    (str(pmid), (mention or "").lower().strip()), [])
+            candidates = _external_to_candidate_entities(ext, mesh_index_for_rules)
+        elif args.bm25_only:
+            candidates = bm25_retriever.retrieve(mention, top_k=args.top_k)
+        elif args.embedding_only:
+            candidates = emb_retriever.retrieve(mention, top_k=args.top_k)
+        else:
+            candidates = retriever.retrieve(mention, top_k=args.top_k)
+        if not args.no_string_normalization and not args.embedding_only:
             variants = generate_variants(mention)
             existing_ids = {c.mesh_id for c in candidates}
             for variant in variants[1:]:  # skip first (= original)
@@ -778,7 +988,7 @@ def run_evaluation(args):
                         abbrev_improved_count += 1
 
         # ── Embedding retrieval (hybrid merge + re-scoring) ──
-        if emb_retriever is not None:
+        if emb_retriever is not None and not args.embedding_only:
             emb_candidates = emb_retriever.retrieve(mention, top_k=args.top_k)
             if emb_candidates:
                 # Merge: add embedding candidates not already in the list
@@ -852,12 +1062,15 @@ def run_evaluation(args):
 
         # ── Phase 3: Re-rank with domain rules ──
         doc_text = context_lookup.get(pmid, {}).get("full_text", "")
-        reranked = reranker.rerank(
-            mention=mention,
-            candidates=candidates,
-            entity_type=entity_type,
-            context=doc_text,
-        )
+        if args.embedding_only or args.bm25_only or args.candidates_from:
+            reranked = candidates          # no rule re-ranking: P3 = retriever's own ranking
+        else:
+            reranked = reranker.rerank(
+                mention=mention,
+                candidates=candidates,
+                entity_type=entity_type,
+                context=doc_text,
+            )
 
         # ── Document topic consistency (optional, after Phase 3) ──
         if topic_scorer is not None:
@@ -1134,6 +1347,32 @@ def run_evaluation(args):
                 "surface_sim": round(surf, 1),            # mention vs top-1 label
             }, ensure_ascii=False) + "\n")
 
+        # Post-P3 candidate list, exactly as the LLM would see it (--llm-top-k).
+        # Carries the sentence and the definitions so an offline re-ranker gets
+        # the same evidence the LLM prompt gets -- otherwise the baseline is
+        # handicapped by construction and the comparison proves nothing.
+        if cand_fh is not None:
+            _ctx = context_lookup.get(pmid, {})
+            _full = _ctx.get("full_text", "")
+            cand_fh.write(json.dumps({
+                "pmid": pmid,
+                "start": mention_start,
+                "mention": mention,
+                "gold": gold_id,
+                "entity_type": entity_type,
+                "sentence": extract_sentence(_full, mention, start=mention_start),
+                "title": _ctx.get("title", ""),
+                "candidates": [{
+                    "cui": c.mesh_id,
+                    "name": c.preferred_label,
+                    "score": round(float(c.score), 4),
+                    # 0 means "unlimited" for --max-definition-len, and a
+                    # zero-length slice would silently blank every definition.
+                    "definition": ((c.definition or "")[:args.max_definition_len]
+                                   if args.max_definition_len else (c.definition or "")),
+                } for c in reranked[:args.llm_top_k]],
+            }, ensure_ascii=False) + "\n")
+
         # ── Track results ──
         if p2_hit:
             p2_correct += 1
@@ -1206,6 +1445,9 @@ def run_evaluation(args):
     if pred_fh is not None:
         pred_fh.close()
         print(f"\n  Per-mention predictions -> {args.dump_predictions}")
+    if cand_fh is not None:
+        cand_fh.close()
+        print(f"  Post-P3 candidate lists -> {args.dump_candidates}")
 
     # ── Fine-tuning dump: finalize ──
     if dump_fh is not None:
@@ -1588,7 +1830,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Full Pipeline Evaluation")
 
     # Dataset selection
-    parser.add_argument("--dataset", choices=["bc5cdr", "biored", "medmentions"],
+    parser.add_argument("--dataset", choices=["bc5cdr", "biored", "medmentions", "ncbi", "nlm_chem"],
                         default="bc5cdr", help="Dataset to evaluate on (default: bc5cdr)")
     parser.add_argument("--split", choices=["train", "dev", "test"],
                         default="test", help="Data split to use (default: test)")
@@ -1657,6 +1899,11 @@ if __name__ == "__main__":
 
     # Embedding retrieval
     parser.add_argument("--embedding", action="store_true", help="Enable embedding-based retrieval (SapBERT + FAISS)")
+    parser.add_argument("--embedding-only", action="store_true",
+                        help="Standalone public dense retriever: candidates AND the "
+                             "confidence gap come purely from SapBERT (no string index, "
+                             "rules, expansion, abbreviation or topic scoring). Used to "
+                             "show the findings hold on a retriever we did not hand-build.")
     parser.add_argument("--embedding-model", default="cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
                         help="HuggingFace model for embedding retrieval")
     parser.add_argument("--embedding-batch-size", type=int, default=256, help="Batch size for encoding")
@@ -1664,6 +1911,30 @@ if __name__ == "__main__":
                         help="Use both SapBERT + BioLinkBERT (multi-model ensemble)")
     parser.add_argument("--hybrid-alpha", type=float, default=0.7,
                         help="Hybrid scoring weight: 0=pure embedding, 1=pure string (default: 0.7)")
+
+    # Named public retrievers (densify the retriever-strength curve, Figure 1)
+    parser.add_argument("--bm25-only", action="store_true",
+                        help="Standalone Okapi BM25 (rank_bm25) over MeSH labels: candidates "
+                             "AND the confidence gap come purely from BM25 (no rapidfuzz, "
+                             "rules, expansion, abbreviation, embedding or topic scoring). "
+                             "A named lexical retriever point for the curve.")
+    parser.add_argument("--candidates-from", default=None, metavar="FILE",
+                        help="Read pre-computed candidate lists from an external retriever "
+                             "(JSONL keyed by pmid+start) instead of retrieving. P3 = the "
+                             "external ranking (no rule re-ranking); P4 (LLM) runs unchanged. "
+                             "Used to put OUR LLM stage on BioSyn/ArboEL candidates faithfully.")
+    parser.add_argument("--dump-mentions", default=None, metavar="FILE",
+                        help="Write the exact eval mention set (pmid, start, mention, gold, "
+                             "entity_type) as JSONL and exit. Feed this to an external "
+                             "retriever so its candidates align byte-for-byte with "
+                             "--candidates-from.")
+    parser.add_argument("--dump-candidates", default=None, metavar="FILE",
+                        help="Write the post-P3 candidate list of every mention as JSONL "
+                             "(same schema as --candidates-from, plus gold, the sentence "
+                             "around the mention and each candidate's definition). This is "
+                             "what an offline re-ranker (cross-encoder) needs to score the "
+                             "IDENTICAL lists the LLM saw. Combine with --no-phase4 to dump "
+                             "without spending a single LLM call.")
 
     # Phase 3 settings
     parser.add_argument("--rule5-boost", type=float, default=2.0)
@@ -1779,6 +2050,11 @@ if __name__ == "__main__":
 
     # Evaluation settings
     parser.add_argument("--limit", type=int, default=None, help="Limit to N mentions")
+    parser.add_argument("--limit-random", action="store_true",
+                        help="Sample --limit rows randomly (fixed seed) instead of head-N. "
+                             "Use for representative subsets of large corpora (MedMentions).")
+    parser.add_argument("--limit-seed", type=int, default=42,
+                        help="Seed for --limit-random sampling.")
     parser.add_argument("--keep-duplicates", action="store_true",
                         help="Evaluate on ALL mentions instead of unique "
                              "(mention, gold) pairs. This is what BioLinkerAI and "
@@ -1789,6 +2065,31 @@ if __name__ == "__main__":
                              "so the default number is NOT comparable to the paper.")
 
     args = parser.parse_args()
+
+    if args.embedding_only:
+        # Pure public dense retriever: force embedding on, disable every hand-built
+        # component so P3 and the confidence gap are SapBERT's alone.
+        args.embedding = True
+        args.no_expansion = True
+        args.no_topic_scoring = True
+        args.no_abbreviation_expansion = True
+
+    if args.bm25_only:
+        # Standalone Okapi BM25: strip every hand-built component so P3 and the
+        # confidence gap are BM25's alone (mirrors --embedding-only for a lexical
+        # named retriever).
+        args.no_expansion = True
+        args.no_topic_scoring = True
+        args.no_abbreviation_expansion = True
+        args.no_string_normalization = True
+
+    if args.candidates_from:
+        # External retriever: candidates come from a file, P3 = their ranking.
+        # Disable every hand-built component; the LLM stage runs unchanged.
+        args.no_expansion = True
+        args.no_topic_scoring = True
+        args.no_abbreviation_expansion = True
+        args.no_string_normalization = True
 
     # Prompt-level overrides: mention context window.
     # --context-sentences wins over --context-words (mutually exclusive modes).

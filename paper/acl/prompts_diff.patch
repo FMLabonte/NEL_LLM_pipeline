@@ -1,0 +1,136 @@
+--- /mnt/user-data/uploads/NEL_LLM_pipeline/src/llm-disambiguation/prompts.py	2026-08-23 10:43:40.422307879 +0000
++++ patch/prompts.py	2026-08-23 10:47:17.731020975 +0000
+@@ -72,6 +72,13 @@
+     context_sentences: int = 0  # >0 = sentence-based window: N sentences on each
+                                 # side of the mention's sentence. Takes priority
+                                 # over context_words. 0 = off.
++    include_score_gap: bool = False
++                                # True = state the retriever's top1-top2 score
++                                # gap explicitly, as a number, above the
++                                # candidate list. include_match_score already
++                                # shows the raw scores; this makes the *margin*
++                                # explicit so the model does not have to
++                                # subtract. Used by the v8-gap ablation.
+ 
+ 
+ # ── Prompt versions ──────────────────────────────────────────────────────
+@@ -315,6 +322,101 @@
+         context_words=64,
+     ),
+ 
++    # ── V8 ablations: what in the prompt holds the danger zone in check? ──
++    # v8 already tells the model to trust the ranking AND shows it the raw
++    # candidate scores, and the mid-confidence danger zone appears anyway.
++    # These three variants take that instruction away, take the scores away,
++    # and make the margin explicit, so the effect of each can be measured
++    # instead of assumed. Everything except the named change is v8.
++
++    # v8 minus the "TRUST THE RANKING" rule.
++    "v8-notrust": PromptConfig(
++        name="v8-notrust",
++        description="v8 without the conservatism instruction (ablation)",
++        system_prompt="""\
++You are a biomedical entity linking expert. You are given a mention highlighted in its context and a list of candidate concepts, pre-ranked by a domain-specific system.
++
++Select the candidate that best matches the mention in that context.
++
++One rule that matters more than it looks:
++
++1. MATCH THE LEVEL OF SPECIFICITY. Pick the concept at the same granularity as the mention. "anxiety" is Anxiety, not Anxiety Disorders. "kidney injury" is Kidney Diseases, not Acute Kidney Injury. "encephalopathy" is Brain Diseases, not a named specific encephalopathy. Only go more specific when the text explicitly names the specific condition.
++
++Respond with ONLY a JSON object, no reasoning, no other text:
++{"entity_name": "<candidate name>", "mesh_id": "<candidate ID>"}
++
++entity_name and mesh_id must be copied exactly from one of the listed candidates.""",
++        response_format="json_entity",
++        use_full_context=False,
++        include_few_shot=True,
++        include_categories=True,
++        include_match_score=True,
++        allow_none=False,
++        ask_reasoning=False,
++        context_words=64,
++    ),
++
++    # v8 with the per-candidate match scores hidden.
++    "v8-noscore": PromptConfig(
++        name="v8-noscore",
++        description="v8 with the candidate match scores hidden (ablation)",
++        system_prompt="""\
++You are a biomedical entity linking expert. You are given a mention highlighted in its context and a list of candidate concepts, pre-ranked by a domain-specific system.
++
++Select the candidate that best matches the mention in that context.
++
++Two rules that matter more than they look:
++
++1. MATCH THE LEVEL OF SPECIFICITY. Pick the concept at the same granularity as the mention. "anxiety" is Anxiety, not Anxiety Disorders. "kidney injury" is Kidney Diseases, not Acute Kidney Injury. "encephalopathy" is Brain Diseases, not a named specific encephalopathy. Only go more specific when the text explicitly names the specific condition.
++
++2. TRUST THE RANKING. The top-ranked candidate is correct in roughly 80% of cases. Override it only when the context gives you clear evidence for a different candidate — not merely a plausible one.
++
++Respond with ONLY a JSON object, no reasoning, no other text:
++{"entity_name": "<candidate name>", "mesh_id": "<candidate ID>"}
++
++entity_name and mesh_id must be copied exactly from one of the listed candidates.""",
++        response_format="json_entity",
++        use_full_context=False,
++        include_few_shot=True,
++        include_categories=True,
++        include_match_score=False,
++        allow_none=False,
++        ask_reasoning=False,
++        context_words=64,
++    ),
++
++    # v8 plus an explicit, quantitative statement of the ranking margin.
++    "v8-gap": PromptConfig(
++        name="v8-gap",
++        description="v8 plus an explicit top1-top2 margin and a margin-conditioned rule",
++        system_prompt="""\
++You are a biomedical entity linking expert. You are given a mention highlighted in its context and a list of candidate concepts, pre-ranked by a domain-specific system.
++
++Select the candidate that best matches the mention in that context.
++
++Three rules that matter more than they look:
++
++1. MATCH THE LEVEL OF SPECIFICITY. Pick the concept at the same granularity as the mention. "anxiety" is Anxiety, not Anxiety Disorders. "kidney injury" is Kidney Diseases, not Acute Kidney Injury. "encephalopathy" is Brain Diseases, not a named specific encephalopathy. Only go more specific when the text explicitly names the specific condition.
++
++2. TRUST THE RANKING. The top-ranked candidate is correct in roughly 80% of cases. Override it only when the context gives you clear evidence for a different candidate — not merely a plausible one.
++
++3. USE THE RANKING MARGIN. You are told how far the top candidate scores above the runner-up. A large margin means the ranking system had no serious competitor and is almost always right — keep the top candidate unless the context flatly contradicts it. A small margin means the system could not separate the top two; that is where your reading of the context decides.
++
++Respond with ONLY a JSON object, no reasoning, no other text:
++{"entity_name": "<candidate name>", "mesh_id": "<candidate ID>"}
++
++entity_name and mesh_id must be copied exactly from one of the listed candidates.""",
++        response_format="json_entity",
++        use_full_context=False,
++        include_few_shot=True,
++        include_categories=True,
++        include_match_score=True,
++        allow_none=False,
++        ask_reasoning=False,
++        context_words=64,
++        include_score_gap=True,
++    ),
++
+     # ── V6-full: v6 with full abstract context ──────────────────────────
+     # Same as v6 but uses the full abstract instead of 200-char window.
+     # Tests whether more context helps the LLM.
+@@ -498,6 +600,17 @@
+ 
+     # ── Candidate list ──
+     parts.append("## Candidates")
++    if config.include_score_gap and len(candidates) >= 2:
++        # Computed from the score values, not from list positions, so it is
++        # correct even when the caller shuffled the candidates.
++        scores = sorted((float(getattr(c, "score", 0.0)) for c in candidates),
++                        reverse=True)
++        gap = scores[0] - scores[1]
++        parts.append(
++            f"**Ranking margin:** the top-ranked candidate scores {gap:.1f} "
++            f"points above the runner-up."
++        )
++        parts.append("")
+     for i, c in enumerate(candidates, 1):
+         # Number-based vs name-based listing
+         if config.response_format == "json_entity":

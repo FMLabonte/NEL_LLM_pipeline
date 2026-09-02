@@ -63,12 +63,9 @@ class UMLSEnricher:
     ):
         self.mrconso_path = Path(mrconso_path)
         self.cache_path = Path(cache_path) if cache_path else None
-
-        if not self.mrconso_path.exists():
-            raise FileNotFoundError(
-                f"MRCONSO.RRF not found at {self.mrconso_path}. "
-                "Download from https://www.nlm.nih.gov/research/umls/licensedcontent/umlsknowledgesources.html"
-            )
+        # NB: we do NOT require MRCONSO.RRF here — if a cache exists, the raw
+        # 16GB file is never read. The existence check happens in _parse_mrconso,
+        # i.e. only when the cache is missing and we actually need to parse.
 
     def get_mesh_synonyms(self, force_refresh: bool = False) -> dict[str, list[str]]:
         """
@@ -105,6 +102,13 @@ class UMLSEnricher:
           Pass 1: Find all MeSH ID → CUI mappings (rows where SAB="MSH")
           Pass 2: For those CUIs, collect all English synonyms from ALL vocabularies
         """
+        if not self.mrconso_path.exists():
+            raise FileNotFoundError(
+                f"MRCONSO.RRF not found at {self.mrconso_path} and no cache "
+                f"present. Either provide the cache (umls_cache.json) or download "
+                f"MRCONSO from https://www.nlm.nih.gov/research/umls/licensedcontent/umlsknowledgesources.html"
+            )
+
         # ── Pass 1: MeSH ID → CUI mapping ──
         print("  Pass 1: Finding MeSH → CUI mappings...")
         mesh_to_cui: dict[str, str] = {}     # MeSH ID → CUI

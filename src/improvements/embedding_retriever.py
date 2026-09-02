@@ -30,6 +30,7 @@ Paper reference: "Planned Improvements" in CLAUDE.md
 
 import os
 import json
+import pickle
 import numpy as np
 from pathlib import Path
 from dataclasses import dataclass
@@ -508,6 +509,139 @@ class MultiEmbeddingRetriever:
             averaged[c.mesh_id] = sum(model_scores) / len(model_scores)
 
         return averaged
+
+
+# ── UMLS Embedding Retriever ────────────────────────────────────────────────
+
+class UMLSEmbeddingRetriever(EmbeddingRetriever):
+    """
+    SapBERT + FAISS retriever over the *UMLS* concept space (for MedMentions).
+
+    The base EmbeddingRetriever encodes MeSH labels; MedMentions links against
+    all of UMLS (~1.4M concepts / ~3.65M labels), so we encode the UMLS index's
+    label list instead and return CUI-keyed candidates. Everything else
+    (encoding, hybrid score_candidates) is inherited unchanged.
+
+    The FAISS index is ~11 GB (3.65M x 768 float32), so we build it incrementally
+    (add per batch, no full-array vstack) and cache it to disk. First build takes
+    ~20-30 min on a GPU; subsequent runs load from cache in seconds.
+
+    Parameters
+    ----------
+    umls_index : UMLSIndex
+        A built UMLSIndex (its ._label_index provides (label, cui) pairs and
+        .entities[cui] provides the concept data).
+    """
+
+    def __init__(self, umls_index, model_name: str = DEFAULT_MODEL,
+                 device: str | None = None, batch_size: int = 256,
+                 max_length: int = 64):
+        super().__init__(mesh_index=None, model_name=model_name, device=device,
+                         batch_size=batch_size, max_length=max_length)
+        self.umls_index = umls_index
+        self.return_cui = True           # MedMentions is evaluated against CUIs
+        self._index_cuis: list[str] = []  # cui at each FAISS position
+
+    # ── Build (incremental add to keep peak memory ~1 batch + index) ──
+    def build_index(self):
+        li = self.umls_index._label_index
+        labels = [lab for (lab, _) in li]
+        cuis = [cui for (_, cui) in li]
+        n, bs = len(labels), self.batch_size
+        n_batches = (n + bs - 1) // bs
+        print(f"\nBuilding UMLS FAISS index...")
+        print(f"  Labels to encode: {n:,} | model: {self.model_name} | device: {self.device}")
+
+        self.faiss_index = None
+        for bi, i in enumerate(range(0, n, bs), 1):
+            embs = self._encode_batch(labels[i:i + bs]).astype(np.float32)
+            if self.faiss_index is None:
+                self._embedding_dim = embs.shape[1]
+                self.faiss_index = faiss.IndexFlatIP(self._embedding_dim)
+            self.faiss_index.add(embs)
+            if bi % 100 == 0 or bi == n_batches:
+                print(f"    encoded {min(i + bs, n):,}/{n:,} "
+                      f"({bi}/{n_batches} batches)", flush=True)
+
+        self._index_labels = labels
+        self._index_cuis = cuis
+        print(f"  FAISS UMLS index built: {self.faiss_index.ntotal:,} vectors "
+              f"(dim={self._embedding_dim})")
+
+    def build_or_load(self, cache_dir: str, max_synonyms_per_entity: int = 0):
+        if not self.load_index(cache_dir):
+            self.build_index()
+            self.save_index(cache_dir)
+
+    # ── Save/load (pickle sidecar; JSON would be huge for 3.65M labels) ──
+    def save_index(self, cache_dir: str):
+        p = Path(cache_dir)
+        p.mkdir(parents=True, exist_ok=True)
+        faiss.write_index(self.faiss_index, str(p / "faiss.index"))
+        with open(p / "meta.pkl", "wb") as f:
+            pickle.dump({
+                "model_name": self.model_name,
+                "embedding_dim": self._embedding_dim,
+                "labels": self._index_labels,
+                "cuis": self._index_cuis,
+            }, f, protocol=4)
+        print(f"  UMLS index saved to {cache_dir}/")
+
+    def load_index(self, cache_dir: str) -> bool:
+        p = Path(cache_dir)
+        if not (p / "faiss.index").exists() or not (p / "meta.pkl").exists():
+            return False
+        with open(p / "meta.pkl", "rb") as f:
+            meta = pickle.load(f)
+        if meta["model_name"] != self.model_name:
+            print(f"  Warning: cached UMLS index built with {meta['model_name']}, "
+                  f"current model {self.model_name}. Rebuilding.")
+            return False
+        print(f"Loading cached UMLS FAISS index from {cache_dir}/...")
+        self._embedding_dim = meta["embedding_dim"]
+        self._index_labels = meta["labels"]
+        self._index_cuis = meta["cuis"]
+        self.faiss_index = faiss.read_index(str(p / "faiss.index"))
+        print(f"  Loaded: {self.faiss_index.ntotal:,} vectors (dim={self._embedding_dim})")
+        return True
+
+    # ── Retrieval (dedup by CUI, build CUI-keyed CandidateEntity) ──
+    def retrieve(self, mention: str, top_k: int = 10) -> list:
+        if self.faiss_index is None:
+            raise RuntimeError("UMLS FAISS index not built. Call build_or_load() first.")
+        from mesh_index import CandidateEntity
+
+        query_emb = self._encode_batch([mention])
+        scores, indices = self.faiss_index.search(query_emb.astype(np.float32), top_k * 3)
+
+        seen = {}
+        for score, idx in zip(scores[0], indices[0]):
+            if idx < 0:
+                continue
+            cui = self._index_cuis[idx]
+            matched_label = self._index_labels[idx] if self._index_labels else ""
+            scaled = float(score) * 100.0
+            if cui not in seen or scaled > seen[cui][0]:
+                seen[cui] = (scaled, matched_label)
+
+        use_cui = self.return_cui or getattr(self.umls_index, "return_cui", False)
+        candidates = []
+        for cui, (score, matched_label) in seen.items():
+            entity = self.umls_index.entities.get(cui)
+            if entity is None:
+                continue
+            entity_id = cui if use_cui else (entity.mesh_ids[0] if entity.mesh_ids else cui)
+            candidates.append(CandidateEntity(
+                mesh_id=entity_id,
+                preferred_label=entity.preferred_label,
+                synonyms=entity.synonyms[:20],
+                definition="",
+                tree_numbers=[],
+                score=score,
+                matched_synonym=matched_label,
+            ))
+        candidates.sort(key=lambda c: c.score, reverse=True)
+        return candidates[:top_k]
 
 
 # ── Quick demo ──────────────────────────────────────────────────────────────

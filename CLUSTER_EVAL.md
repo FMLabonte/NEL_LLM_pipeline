@@ -49,8 +49,11 @@ pip install vllm rapidfuzz faiss-cpu openai pandas numpy
 
 ## 3. Smoke-Test (verifiziert Daten + Serving), interaktiv auf GPU
 
+WICHTIG — nur A40 nutzen: eval_env ist auf dem Intel-Login-Node gebaut; die
+A100-Nodes sind AMD und werfen "Illegal instruction". Alles auf A40 halten.
+
 ```bash
-srun --pty --partition=A100devel --gpus=1 /bin/bash
+srun --pty --partition=A40devel --gpus=1 /bin/bash
 module load Python && source ~/NEL_LLM_pipeline/eval_env/bin/activate
 cd ~/NEL_LLM_pipeline
 # nur die Kandidatengenerierung, ohne LLM, 5 Mentions -> lädt alle Daten/Caches:
