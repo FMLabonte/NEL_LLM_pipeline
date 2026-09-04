@@ -48,7 +48,7 @@ doing so. We do not propose a new method: we ask \emph{how much}, \emph{when}, a
 measuring instrument, we run one fixed open 4B disambiguator behind fourteen
 retriever configurations spanning five corpora (BC5CDR, BioRED, NCBI-Disease,
 NLM-Chem, MedMentions) and four retrievers, including two public systems we did not
-build. Three results follow. (i) The stage's contribution is set by the retriever,
+build. Four results follow. (i) The stage's contribution is set by the retriever,
 not by the model: it ranges from $+0.6$ to $+10.1$ \acc{} points with the same model
 and prompt, and \emph{within} a corpus a stronger retriever reliably means a smaller
 gain (12/14 ordered pairs; dataset-demeaned $\rho=-0.72$, $p=0.004$). Degrading one
@@ -62,9 +62,15 @@ prompt ablations, including one that states the retriever's margin as a number a
 instructs the model to defer on large margins. (iii) LoRA fine-tuning does not improve the model where
 disambiguation is hard---precision on the truly-uncertain band is unchanged---but
 installs a confidence-dependent \emph{restraint} whose reliability benefit is bound
-to the training distribution: on held-out corpora it raises intervention precision
-from 69\% to 96\% on concepts seen in fine-tuning and from 72\% to 74\% on unseen
-ones. We release all prediction dumps and analysis code.
+to the training distribution: over three seeds, on held-out corpora it raises
+intervention precision from $69\%$ to $91\%$ on concepts seen in fine-tuning while on
+unseen ones precision does not improve at all ($72\% \to 70\%$). (iv) A $109$M-parameter
+cross-encoder on the identical candidate lists beats the $4$B LLM in-domain
+($+2.1$ points, CI excluding zero) and loses to it on the corpus furthest from its
+training data, so what the generative stage buys is transfer rather than
+disambiguation as such --- and it reproduces the same net-harmful band once its
+interventions stop tracking retriever confidence, which places that failure outside
+language models entirely. We release all prediction dumps and analysis code.
 \end{abstract}
 
 \section{Introduction}
@@ -571,7 +577,92 @@ exactly the four with an aggressiveness ratio above $1$.
 Granite is not worse at \emph{choosing}. Its selection skill in the harmful band ($2.07$
 on BC5CDR) is above the 4B's ($1.36$); both are far below the ratio needed to break even
 there ($3.7$). What separates the models is not judgement but allocation --- the same
-distinction fine-tuning turns out to act on (\S\ref{sec:f2}).
+distinction fine-tuning turns out to act on (\S\ref{sec:f2}) and the same distinction a
+non-generative stage turns out to obey (\S\ref{sec:ce}).
+
+\subsection{Is a language model needed at all?}\label{sec:ce}
+
+\begin{table}[t]
+\centering\footnotesize
+\setlength{\tabcolsep}{3.0pt}
+\newcommand{\ci}[3]{#1$^{\,\text{\tiny #3}}_{\,\text{\tiny #2}}$}
+\begin{tabular}{lrrrl}
+\toprule
+& \multicolumn{3}{c}{$\Delta$ \acc{} of the stage} & \\
+\cmidrule(lr){2-4}
+Corpus & LLM & CE$_{\text{zs}}$ & CE$_{\text{ft}}$ & CE$_{\text{ft}}-$LLM \\
+\midrule
+BC5CDR$^\dagger$ & +0.9 & --45.8 & +3.1 & \ci{\textbf{+2.14}}{+1.00}{+3.29} \\
+BioRED & +4.0 & --47.1 & +3.6 & \ci{--0.42}{--3.36}{+2.38} \\
+NCBI & +2.4 & --30.7 & +1.0 & \ci{--1.39}{--7.30}{+4.16} \\
+NLM-Chem & +5.1 & --45.7 & +0.4 & \ci{\textbf{--4.67}}{--8.60}{--0.56} \\
+\bottomrule
+\end{tabular}
+\caption{A $109$M-parameter cross-encoder on the \emph{identical} candidate lists,
+against the $4$B zero-shot LLM; the retrievers are those of Table~\ref{tab:models}.
+CE$_{\text{zs}}$ is MedCPT off the shelf;
+CE$_{\text{ft}}$ is the same model trained on the BC5CDR training split with a listwise
+objective over the same lists. The last column is the paired document-bootstrap
+difference with its $95\%$ interval as sub/superscript, \textbf{bold} when it excludes
+zero. $^\dagger$in-domain for CE$_{\text{ft}}$; the other three corpora are held out,
+the same split structure as \S\ref{sec:f2}.}
+\label{tab:ce}
+\end{table}
+
+Everything so far compares generative disambiguators with each other. The question a
+practitioner asks first is different: does the stage need to be a language model? We put
+a cross-encoder on the same candidate lists --- same mentions, same top-$10$, same
+names, definitions and sentence --- and score it with the same code, so the document
+bootstrap is exactly paired (Table~\ref{tab:ce}). We use MedCPT
+\citep{jin-etal-2023-medcpt}, a $109$M-parameter biomedical re-ranker, about $1/40$ the
+size of the disambiguator, in two variants: off the shelf, and trained on the BC5CDR
+training split with a listwise objective over the candidate lists --- the same task the
+LLM is given, and the re-ranker counterpart of \S\ref{sec:f2}'s LoRA run.
+
+\paragraph{Off the shelf it fails, informatively.} The zero-shot cross-encoder loses
+$31$ to $47$ points on every corpus, intervening on $61$--$72\%$ of mentions at an
+intervention precision of $4$--$17\%$. Its selection skill is below $1$ in
+\emph{all twenty} band$\times$corpus cells (range $0.00$--$0.79$): it does not merely
+over-ride too often, it chooses worse than blind over-riding would. A retrieval
+cross-encoder does not transfer to concept ranking without training. We report it
+because it is the configuration a reader would reach for first, and because it sets the
+floor the trained variant has to clear.
+
+\paragraph{Trained, it beats the LLM in-domain.} On BC5CDR the $109$M cross-encoder adds
+$+3.1$ points against the $4$B model's $+0.9$, a paired difference of $+2.14$ with a CI
+that excludes zero. On the corpus you can train on, the generative stage buys nothing
+that a re-ranker two orders of magnitude smaller does not buy more of. It also removes
+the inversion zone: band $[10,20)$ goes from $-2.4$ under the LLM to $+1.4$, the only
+positive value for that band anywhere in this paper. The danger zone is therefore not
+inevitable --- it is what a stage does when its aggressiveness is not conditioned on
+retriever confidence, and a stage trained on this distribution conditions correctly.
+
+\paragraph{Out of domain the advantage is gone.} On BioRED and NCBI-Disease the
+difference from the LLM is indistinguishable from zero, and on NLM-Chem the LLM is
+significantly better ($-4.67$, CI $[-8.60,-0.56]$). Against the \emph{equally trained}
+LLM of Table~\ref{tab:ft}, on the three corpora whose mention sets match, the gap widens
+with distance from the training data: $86.5$ vs.\ $85.8$ in-domain, $85.0$ vs.\ $83.1$
+on BioRED, $77.9$ vs.\ $71.1$ on NCBI-Disease. This is \S\ref{sec:f2}'s deference
+result in a second model class: what training buys a re-ranking stage is bound to the
+distribution it was trained on, and the LLM's residual contribution is transfer rather
+than disambiguation as such.
+
+The calibration columns say it in the mechanism's own terms. In-domain the trained
+cross-encoder's aggressiveness ratio is flat at $1.01, 0.98, 0.98, 1.01, 0.45$ --- it
+intervenes about as often as the retriever errs, and backs off only where the retriever
+is overwhelming. On the held-out corpora the same model rises \emph{above} $1$ in the
+two most confident bands ($1.27$ and $1.92$ on NCBI-Disease, $1.19$ and $1.88$ on
+NLM-Chem), over-riding more often than the retriever is wrong exactly where it is most
+reliable. That is Granite's profile from Table~\ref{tab:models}, produced here by a
+model with no generative capacity at all. The failure mode we have been describing is
+not a property of language models; it is a property of a re-ranking stage whose
+allocation is not tied to the retriever's confidence.
+
+For deployment the reading is concrete. Where the target distribution is available for
+training, a $109$M re-ranker is the better purchase. Where it is not --- a new corpus, a
+new entity type, a knowledge base that moves --- the LLM is the stage that survives the
+shift, and that, rather than raw disambiguation skill, is what the generative stage is
+being paid for.
 
 \subsection{The consequence: a confidence gate}
 
@@ -773,17 +864,15 @@ biomedical deployment cares about.
 
 \section*{Limitations}
 
-\paragraph{No non-LLM re-ranker baseline.} The zero-shot results cover three
-disambiguators from two families (\S\ref{sec:models}) and the fine-tuning results three
-seeds (\S\ref{sec:f2}), so the effects are not properties of one model or one run. What
-we do not have is a \emph{non-generative} comparison: a cross-encoder re-ranker over the
-identical candidate lists. Cross-encoders are the established strong re-ranker for
-biomedical EL, and without one we cannot say whether the behaviour we describe is
-specific to LLM disambiguators or general to any learned re-ranking stage placed behind
-a strong retriever. We regard this as the most important open comparison, and note that
-either outcome would sharpen rather than undermine the account: a cross-encoder without
-an inversion zone would make the practical recommendation concrete, and one with an
-inversion zone would widen the claim beyond LLMs.
+\paragraph{The re-ranker baseline is one architecture and one recipe.} The
+cross-encoder of \S\ref{sec:ce} is MedCPT initialised, trained with a listwise objective
+on BC5CDR only, one seed. That matches \S\ref{sec:f2}'s LoRA setup by design, so
+``held out'' means the same thing on both sides, but it leaves the obvious stronger
+baseline untested: a re-ranker trained on all four corpora, or a bi-encoder--cross-encoder
+architecture built for entity linking rather than passage retrieval, might transfer
+where ours does not. Our transfer claim is therefore about \emph{this} re-ranker
+against \emph{this} LLM under a matched training budget, not about the two model
+classes in general.
 
 \paragraph{Fine-tuning is one recipe.} The deference result uses LoRA SFT on the gold
 answer, over three seeds. It does not tell us what a different objective would buy. The

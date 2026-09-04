@@ -239,11 +239,24 @@ identischen Schema. Dadurch sind Mentions, Listen und alle P3-Felder
 byte-gleich mit dem LLM-Lauf — der Dokument-Bootstrap ist exakt gepaart, ohne
 Teilmengen und ohne Ausreden.
 
-### Schritt A — Kandidatenlisten dumpen (ca. 1–2 h, GPU, kein vLLM)
+### Schritt A — Kandidatenlisten dumpen (8–11 h, GPU, kein vLLM)
 
 ```bash
 sbatch bender_dump_candidates.sbatch
 ```
+
+**Zeitbudget, gemessen statt geschätzt.** Der erste Anlauf (Job 248348) lief in
+ein 3-Stunden-Limit, das ich zu knapp gesetzt hatte — A40short erlaubt 8 h,
+A40medium einen Tag. Aus dem Lauf: BC5CDR-Test ~2 h 50 (9.661 Mentions, rund
+1 s/Mention ohne LLM), BioRED 9 min. Der Job steht jetzt auf A40medium/16 h und
+arbeitet die Korpora nach Wert ab — BC5CDR-Test zuerst, weil es sowohl den
+Cross-Encoder als auch die GRPO-Vorstudie freischaltet, NLM-Chem zuletzt.
+
+Ein Dump gilt nur als fertig, wenn die Begleitdatei `*.docs.jsonl` existiert
+**und** die Kandidaten `synonyms` tragen. Die erste Fassung schrieb beides
+nicht; ein blosses „Datei existiert" würde genau die unbrauchbaren Dumps
+überspringen — derselbe Fehlertyp wie damals beim abgeschnittenen LoRA-Merge.
+Alte Dumps werden deshalb automatisch verworfen und neu erzeugt.
 
 Läuft mit `--no-phase4`, also ohne einen einzigen LLM-Call. Die GPU wird nur
 für SapBERT/FAISS gebraucht, weil die Referenzläufe `--embedding` benutzen. Die
@@ -252,9 +265,16 @@ Retriever-Flags sind wörtlich aus den Eval-Jobs kopiert; wer einen davon
 `analyze_robustness.py` einen P3-Mismatch (genau dafür ist die Prüfung da).
 
 Erzeugt `cands_p3_{bc5cdr,biored,ncbi,nlmchem}.jsonl` plus
-`cands_p3_bc5cdr_train.jsonl` für das Training. Jede Zeile enthält die
-Top-10-Liste nach P3, den Satz um die Mention und die Definitionen — also
-genau die Evidenz, die auch im LLM-Prompt steht.
+`cands_p3_bc5cdr_train.jsonl` für das Training, und zu jedem eine
+`*.docs.jsonl` mit den Dokumenttexten. Jede Zeile enthält die Top-10-Liste nach
+P3, den Satz um die Mention, die Definitionen und die Synonyme.
+
+Warum die Dokumenttexte separat: **v8 benutzt gar nicht den Satz**, sondern ein
+64-Wort-Fenster um die Mention im vollen Dokument (`context_words=64`,
+`use_full_context=False`). Ohne die Texte lässt sich der Prompt offline nicht
+rekonstruieren, und jede Aussage „gleicher Prompt wie im Paper" wäre falsch.
+Einmal pro Dokument statt pro Mention geschrieben — bei NLM-Chem wären das
+sonst rund 500 MB.
 
 ### Schritt B — Re-Ranker scoren (ca. 30 min)
 
@@ -311,16 +331,65 @@ und deshalb gibt es die trainierte Variante überhaupt.
 
 ---
 
+## 7. GRPO-Vorstudie — bevor irgendwer RL-Code schreibt
+
+```bash
+sbatch bender_grpo_pilot.sbatch      # braucht nur cands_p3_bc5cdr* aus Abschnitt 6
+```
+
+Eine Frage: **hat GRPO auf dieser Aufgabe überhaupt einen Gradienten?** GRPO
+normiert den Reward innerhalb der Gruppe,
+
+    A_i = (r_i − mean(r)) / std(r)
+
+Sind alle *G* Rollouts gleich gut, ist die Standardabweichung null, jeder
+Advantage null, und die Gruppe trägt nichts zum Update bei. Bei
+enum-beschränktem Decoding über zehn Kandidaten und einem Retriever, der auf
+BC5CDR schon 82,7 % richtig liegt, ist das nicht der Randfall, sondern das
+erwartbare Normalverhalten. Das ist die eine ungetestete Annahme, auf der der
+ganze RL-Teil steht — und sie kostet hier zwei GPU-Stunden statt zwei Wochen.
+
+Kein RL, keine Trainingsschleife: *G* Rollouts pro Mention bei mehreren
+Temperaturen, durch denselben Endpunkt, denselben v8-Prompt und denselben
+Enum-Decoder. Jede Gruppe fällt in eine von vier Klassen:
+
+| Klasse | Bedeutung |
+|---|---|
+| alle richtig | kann das Modell schon |
+| alle falsch, Gold in der Liste | schwer, aber lernbar |
+| alle falsch, Gold nie retrieved | **unlernbar**, muss aus dem RL-Set raus |
+| gemischt | nicht-degeneriert: das effektive Trainingsset |
+
+`T = 0.0` läuft als Kontrolle mit: dort **muss** der gemischte Anteil exakt 0
+sein. Ist er das nicht, sampelt vLLM trotz `temperature 0` und alle anderen
+Zahlen messen etwas anderes als gedacht.
+
+Die Aufschlüsselung nach Confidence-Band ist der inhaltlich interessante Teil.
+Landen die gemischten Gruppen im mittleren Band, setzt GRPO seinen Gradienten
+genau dort an, wo das Paper das Problem verortet — dann hängen die beiden
+Hälften des Projekts inhaltlich zusammen und nicht nur zeitlich.
+
+**Was ein schlechtes Ergebnis bedeutet.** Liegt der gemischte Anteil im
+niedrigen einstelligen Bereich, ist naives GRPO hier tot, und es braucht einen
+dichteren Reward (Rang des Golds statt binär), Curriculum-Filterung auf die
+lernbaren Gruppen, oder mehr Temperatur mit dem entsprechenden Rauschen. Das
+ist kein Rückschlag, sondern der Befund, der die Methodensektion des
+RL-Papers trägt.
+
+---
+
 ## Reihenfolge, wenn die Zeit knapp ist
 
 Der Lab Report ist am **23.09.2026** fällig, also gut drei Wochen.
 
-1. `bender_dump_candidates.sbatch`, dann `bender_crossencoder.sbatch`
-   (Abschnitt 6). Zusammen unter drei Stunden Cluster-Zeit und der einzige
-   inhaltlich offene Punkt.
-2. Lab Report schreiben. Das Paper ist inhaltlich fertig; für den Report fehlt
+1. `bender_dump_candidates.sbatch` (Abschnitt 6, 8–11 h). Schaltet beides
+   frei: den Cross-Encoder und die GRPO-Vorstudie.
+2. `bender_crossencoder.sbatch` (~30 min) — der einzige inhaltlich offene Punkt
+   am Paper. `bender_grpo_pilot.sbatch` (~2 h) kann parallel laufen, sobald
+   `cands_p3_bc5cdr*` da ist; es gehört zum RL-Teil, nicht zum Lab Report.
+3. Lab Report schreiben. Das Paper ist inhaltlich fertig; für den Report fehlt
    nur die Einordnung, nicht neue Empirie.
-3. `scripts/make_release.py` (Abschnitt 5) — erst kurz vor einer echten
+4. `scripts/make_release.py` (Abschnitt 5) — erst kurz vor einer echten
    Einreichung nötig, nicht für den Report.
 
 Der Seitenumfang ist zu beachten: das Paper liegt bei ~9,7 Seiten Inhalt, das

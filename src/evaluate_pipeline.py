@@ -864,6 +864,7 @@ def run_evaluation(args):
 
     # Post-P3 candidate dump (offline re-rankers: cross-encoder baseline)
     cand_fh = None
+    cand_docs = {}
     if getattr(args, "dump_candidates", None):
         cp = Path(args.dump_candidates)
         cp.parent.mkdir(parents=True, exist_ok=True)
@@ -1354,6 +1355,13 @@ def run_evaluation(args):
         if cand_fh is not None:
             _ctx = context_lookup.get(pmid, {})
             _full = _ctx.get("full_text", "")
+            # The v8 prompt windows the FULL document around the mention offset
+            # (context_words=64), so the sentence alone cannot reconstruct it.
+            # Documents are written once to a companion file instead of being
+            # repeated on every row -- NLM-Chem full texts would be ~500 MB.
+            if pmid not in cand_docs:
+                cand_docs[pmid] = {"pmid": pmid, "title": _ctx.get("title", ""),
+                                   "full_text": _full}
             cand_fh.write(json.dumps({
                 "pmid": pmid,
                 "start": mention_start,
@@ -1370,6 +1378,10 @@ def run_evaluation(args):
                     # zero-length slice would silently blank every definition.
                     "definition": ((c.definition or "")[:args.max_definition_len]
                                    if args.max_definition_len else (c.definition or "")),
+                    # build_user_prompt() reads synonyms, so the dump carries
+                    # them: without this the prompt cannot be reconstructed
+                    # offline and any "same prompt" claim would be false.
+                    "synonyms": list(c.synonyms or [])[:12],
                 } for c in reranked[:args.llm_top_k]],
             }, ensure_ascii=False) + "\n")
 
@@ -1447,7 +1459,12 @@ def run_evaluation(args):
         print(f"\n  Per-mention predictions -> {args.dump_predictions}")
     if cand_fh is not None:
         cand_fh.close()
+        dp = Path(str(args.dump_candidates).replace(".jsonl", "") + ".docs.jsonl")
+        with open(dp, "w") as dfh:
+            for rec in cand_docs.values():
+                dfh.write(json.dumps(rec, ensure_ascii=False) + "\n")
         print(f"  Post-P3 candidate lists -> {args.dump_candidates}")
+        print(f"  Document texts ({len(cand_docs)}) -> {dp}")
 
     # ── Fine-tuning dump: finalize ──
     if dump_fh is not None:
