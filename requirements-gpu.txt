@@ -1,0 +1,29 @@
+# Everything in requirements.txt plus the GPU parts used on the cluster.
+-r requirements.txt
+
+# Dense retrieval (--embedding, --embedding-only) and the MedCPT cross-encoder
+torch>=2.1
+transformers>=4.46
+huggingface_hub
+faiss-cpu            # or faiss-gpu
+
+# Standalone BM25 retriever (--bm25-only)
+rank-bm25
+
+# LoRA fine-tuning (src/finetune_lora.py, scripts/merge_lora.py)
+peft>=0.13
+trl>=0.12
+accelerate
+bitsandbytes         # 4-bit base weights
+datasets
+
+# Serving the LLM on the cluster (the reported runs used vLLM with an
+# OpenAI-compatible endpoint; see cluster/*.sbatch)
+vllm
+
+# Optional: Elasticsearch backend (--backend elasticsearch; default is rapidfuzz)
+# elasticsearch>=8.0,<9.0
+
+# Optional: learned ranker (--train-ranker / --learned-ranker)
+scikit-learn
+xgboost
