@@ -30,7 +30,7 @@ scripts/              stand-alone tools (BioSyn, cross-encoder, LoRA merge, GRPO
   figures/                all figure scripts for the paper and the lab report (see its README)
 cluster/              SLURM jobs for the Bender cluster (submit from the repository root)
 docs/                 working notes: cluster runs, fine-tuning, next steps
-gui/                  small Flask web interface for single abstracts
+gui/                  small Flask web interface (see "Web interface" below)
 pubtator_parser.py    loader for PubTator files (used by the whole pipeline)
 ```
 
@@ -116,6 +116,37 @@ the final answer and the retriever's confidence. All analyses and figures are
 computed from such files.
 
 Available datasets: `bc5cdr`, `biored`, `ncbi`, `nlm_chem`, `medmentions`.
+
+## Web interface
+
+`gui/` contains a small Flask app for trying the pipeline on a single abstract
+or PDF without the command line.
+
+```bash
+pip install flask PyMuPDF      # PyMuPDF is only needed for PDF upload
+python3 gui/app.py
+```
+
+Then open http://localhost:5555 in the browser.
+
+1. Choose the pipeline components in the left panel and click "Initialize
+   Pipeline". This builds the MeSH index and takes about a minute. If you only
+   installed `requirements.txt`, switch off "SapBERT Embeddings" first, since
+   it needs the packages from `requirements-gpu.txt`.
+2. In the tab "Entity Linking", paste a text or upload a PDF, enter the
+   mentions to link (one per line or comma-separated) and click "Link
+   Entities". "Load Example" fills in an example abstract. The result lists
+   the ranked MeSH candidates with their scores for each mention.
+3. In the tab "Evaluation", run the retriever (Phases 2 and 3, without the
+   LLM) on BC5CDR, BioRED or MedMentions, optionally on a limited number of
+   mentions.
+
+The switch "LLM Disambiguation" sends the candidates to an LM Studio server at
+`localhost:1234` with the model `qwen3.5-9b`. To use another model or
+endpoint, change `llm_model` and `llm_base_url` in `init_pipeline()` in
+`gui/app.py`. The web interface uses the interactive pipeline in
+`src/pipeline.py` and is meant for exploration. The reported numbers come from
+`src/evaluate_pipeline.py` with the settings above.
 
 ## Full runs
 
