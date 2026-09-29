@@ -1,0 +1,175 @@
+% Report version of visualizations/our_pipeline.tex (single page).
+% Phase 4 models = Qwen3, Granite; cascading removed; LoRA fine-tuning
+% implemented; MedCPT cross-encoder added; planned items removed.
+\documentclass[border=1mm]{standalone}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{tikz}
+\usepackage{xcolor}
+\usetikzlibrary{positioning, arrows.meta, fit, backgrounds, calc}
+
+% ── Phase Colors (always visible) ──
+\definecolor{p1col}{HTML}{4A90D9}
+\definecolor{p2col}{HTML}{7B68EE}
+\definecolor{p3col}{HTML}{F0A830}
+\definecolor{p4col}{HTML}{2ECC71}
+% ── Extension Colors ──
+\definecolor{donecol}{HTML}{D5D5D5}
+\definecolor{doneborder}{HTML}{888888}
+% ── Planned Colors ──
+\definecolor{plancol}{HTML}{FFF3CC}
+\definecolor{planbordercol}{HTML}{CC9900}
+% ── Misc ──
+\definecolor{arrowcol}{HTML}{555555}
+% ── Hidden Colors ──
+\definecolor{hfill}{HTML}{FAFAFA}
+\definecolor{hdraw}{HTML}{F2F2F2}
+\definecolor{htxt}{HTML}{EEEEEE}
+
+\newcommand{\drawourpipeline}[4]{%
+  % #1=P2 extensions, #2=P3 extensions, #3=P4 extensions, #4=planned
+  % Each: v(visible) or h(hidden)
+  %
+  % ── Phase 2 extension colors ──
+  \ifx#1v%
+    \colorlet{e2fill}{donecol}\colorlet{e2draw}{doneborder}%
+    \colorlet{e2txt}{black}\colorlet{e2arr}{doneborder}%
+  \else%
+    \colorlet{e2fill}{hfill}\colorlet{e2draw}{hdraw}%
+    \colorlet{e2txt}{htxt}\colorlet{e2arr}{hdraw}%
+  \fi%
+  % ── Phase 3 extension colors ──
+  \ifx#2v%
+    \colorlet{e3fill}{donecol}\colorlet{e3draw}{doneborder}%
+    \colorlet{e3txt}{black}\colorlet{e3arr}{doneborder}%
+  \else%
+    \colorlet{e3fill}{hfill}\colorlet{e3draw}{hdraw}%
+    \colorlet{e3txt}{htxt}\colorlet{e3arr}{hdraw}%
+  \fi%
+  % ── Phase 4 extension colors ──
+  \ifx#3v%
+    \colorlet{e4fill}{donecol}\colorlet{e4draw}{doneborder}%
+    \colorlet{e4txt}{black}\colorlet{e4arr}{doneborder}%
+  \else%
+    \colorlet{e4fill}{hfill}\colorlet{e4draw}{hdraw}%
+    \colorlet{e4txt}{htxt}\colorlet{e4arr}{hdraw}%
+  \fi%
+  % ── Planned colors ──
+  \ifx#4v%
+    \colorlet{pfill}{plancol}\colorlet{pdraw}{planbordercol}%
+    \colorlet{ptxt}{black}\colorlet{parr}{planbordercol}%
+  \else%
+    \colorlet{pfill}{hfill}\colorlet{pdraw}{hdraw}%
+    \colorlet{ptxt}{htxt}\colorlet{parr}{hdraw}%
+  \fi%
+  %
+  \begin{tikzpicture}[
+    >=Stealth, node distance=0.4cm,
+    phase/.style={rounded corners=5pt, draw=##1!60!black, fill=##1,
+      text=white, font=\small\bfseries, minimum height=1.0cm,
+      minimum width=2.6cm, align=center},
+    module/.style={rounded corners=3pt, draw=##1!60!black, fill=##1!80,
+      text=white, font=\scriptsize, minimum height=0.6cm,
+      minimum width=2.2cm, align=center},
+    ext2/.style={rounded corners=3pt, draw=e2draw, fill=e2fill,
+      font=\scriptsize, minimum height=0.55cm, align=center, text=e2txt},
+    ext3/.style={rounded corners=3pt, draw=e3draw, fill=e3fill,
+      font=\scriptsize, minimum height=0.55cm, align=center, text=e3txt},
+    ext4/.style={rounded corners=3pt, draw=e4draw, fill=e4fill,
+      font=\scriptsize, minimum height=0.55cm, align=center, text=e4txt},
+    plan/.style={rounded corners=3pt, draw=pdraw, fill=pfill,
+      font=\scriptsize, minimum height=0.55cm, align=center, text=ptxt, dashed},
+    io/.style={rounded corners=4pt, draw=gray!50, fill=white,
+      font=\scriptsize, minimum height=0.8cm, align=center, minimum width=1.8cm},
+    arr/.style={->, arrowcol, thick},
+    lbl/.style={font=\tiny\itshape, text=gray!70!black}
+  ]
+  % Fixed bounding box (same for all 5 pages)
+  \useasboundingbox (-1.2,-4.25) rectangle (23.2, 3.55);
+  %
+  % ========== BASE PIPELINE (always visible) ==========
+  \node[io] (input) {Input\\[-1pt]\tiny Raw Text / Entities};
+  \node[phase=p1col, right=1.0cm of input] (p1) {Phase 1\\[-2pt]\scriptsize Entity Extraction};
+  \node[module=p1col, below=0.2cm of p1] (p1mod) {spaCy + Rules 1--4};
+  \node[phase=p2col, right=1.8cm of p1] (p2) {Phase 2\\[-2pt]\scriptsize Candidate Generation};
+  \node[module=p2col, below=0.2cm of p2] (p2mod) {MeSH Search\\+ Enrichment};
+  \node[phase=p3col, right=1.8cm of p2] (p3) {Phase 3\\[-2pt]\scriptsize Re-Ranking};
+  \node[module=p3col, below=0.2cm of p3] (p3mod) {Domain Rules 5--7};
+  \node[phase=p4col, right=1.8cm of p3] (p4) {Phase 4\\[-2pt]\scriptsize LLM Disambiguation};
+  \node[module=p4col, below=0.2cm of p4] (p4mod) {Qwen3, Granite};
+  \node[io, right=1.0cm of p4] (output) {Output\\[-1pt]\tiny MeSH ID + Score};
+  % Main arrows
+  \draw[arr] (input) -- (p1);
+  \draw[arr] (p1) -- node[lbl, above] {mentions} (p2);
+  \draw[arr] (p2) -- node[lbl, above] {ranked} (p3);
+  \draw[arr] (p3) -- node[lbl, above] {reranked} (p4);
+  \draw[arr] (p4) -- (output);
+  \draw[arr, gray!40] (input.north) to[out=25, in=155]
+    node[lbl, above, pos=0.45] {skip P1 (gold entities)} (p2.north west);
+  %
+  % ========== PHASE 2 EXTENSIONS ==========
+  % Abbreviation Expansion (LLM) — above P1, arrow to P2
+  \node[ext2, above=2.3cm of p1, text width=2.2cm] (abbrllm)
+    {Abbreviation\\Expansion (LLM)};
+  \draw[->, color=e2arr, thick] (abbrllm.south) -- ++(0,-0.4) -| (p2.north);
+  % String Normalization — above P2
+  \node[ext2, above=1.1cm of p2, text width=2.2cm] (strnorm)
+    {String\\Normalization};
+  \draw[->, color=e2arr, thick] (strnorm) -- (p2);
+  % SapBERT + FAISS — below P2
+  \node[ext2, below=0.35cm of p2mod, text width=2.6cm] (embed)
+    {SapBERT + FAISS\\Embedding Retrieval};
+  \draw[->, color=e2arr, thick] (embed) -- (p2mod);
+  % Hybrid Scoring — below embedding
+  \node[ext2, below=0.25cm of embed, text width=2.6cm] (hybrid)
+    {Hybrid Scoring\\{\tiny 70\% string / 30\% embedding}};
+  \draw[->, color=e2arr, thick] (hybrid) -- (embed);
+  %
+  % ========== PHASE 3 EXTENSIONS ==========
+  % Candidate Expansion — between P2 and P3
+  \node[ext3, above=1.1cm of $(p2.east)!0.5!(p3.west)$, text width=2.0cm] (cexp)
+    {Candidate\\Expansion};
+  \draw[->, color=e3arr, thick] (cexp) -- ($(p2.north east)!0.7!(p2.north east)+(0,0.05)$);
+  \draw[->, color=e3arr, thick] (cexp) -- ($(p3.north west)!0.7!(p3.north west)+(0,0.05)$);
+  % Topic Scoring — above P3
+  \node[ext3, above=1.1cm of p3, text width=2.0cm] (topic)
+    {Topic\\Scoring};
+  \draw[->, color=e3arr, thick] (topic) -- (p3);
+  %
+  % ========== PHASE 4 EXTENSIONS ==========
+  % Chain-of-Thought Prompting — above P4
+  \node[ext4, above=1.1cm of p4, text width=2.2cm] (cot)
+    {Chain-of-Thought\\Prompting};
+  \draw[->, color=e4arr, thick] (cot) -- (p4);
+  % Context Enrichment — right of CoT
+  \node[ext4, right=0.3cm of cot, text width=2.0cm] (ctx)
+    {Context\\Enrichment};
+  \draw[->, color=e4arr, thick] (ctx) -- (p4);
+  % LoRA fine-tuning — below P4 (implemented)
+  \node[ext4, below=0.35cm of p4mod, text width=2.2cm] (finetune)
+    {LoRA\\Fine-Tuning};
+  \draw[->, color=e4arr, thick] (finetune) -- (p4mod);
+  % MedCPT cross-encoder — non-generative alternative to the LLM
+  \node[ext4, right=0.3cm of finetune, text width=2.2cm] (ce)
+    {MedCPT Cross-Encoder\\{\tiny (replaces the LLM)}};
+  \draw[->, color=e4arr, thick] (ce.north) -- (ce.north |- p4mod.south east) -- (p4mod.south east);
+  %
+  % ========== LEGEND ==========
+  \node[anchor=north west, font=\footnotesize] at (-1, -3.8) {%
+    \tikz[baseline=-0.5ex]\draw[thick, rounded corners=2pt, fill=p1col] (0,0) rectangle (0.4,0.25);
+    \kern1pt
+    \tikz[baseline=-0.5ex]\draw[thick, rounded corners=2pt, fill=p2col] (0,0) rectangle (0.4,0.25);
+    \kern1pt
+    \tikz[baseline=-0.5ex]\draw[thick, rounded corners=2pt, fill=p3col] (0,0) rectangle (0.4,0.25);
+    \kern1pt
+    \tikz[baseline=-0.5ex]\draw[thick, rounded corners=2pt, fill=p4col] (0,0) rectangle (0.4,0.25);
+    \kern4pt Baseline phases \qquad
+    \tikz[baseline=-0.5ex]\draw[thick, rounded corners=2pt, draw=doneborder, fill=donecol] (0,0) rectangle (0.4,0.25);
+    \kern4pt Implemented extensions%
+  };
+  \end{tikzpicture}%
+}
+
+\begin{document}
+\drawourpipeline{v}{v}{v}{h}
+\end{document}

@@ -17,8 +17,9 @@ env/
 *.swp
 *.swo
 
-# Jupyter
+# Jupyter / pytest
 .ipynb_checkpoints/
+.pytest_cache/
 
 # OS / office lock files
 .DS_Store
@@ -69,15 +70,13 @@ finding*.json
 points_*.json
 evaluation_log.json
 pipeline_evaluation_log.json
-visualizations/**
 
 # Cluster stdout/stderr (43 MB and growing; keep on Bender)
 bender_logs/
 *.log
 slurm-*.out
 
-# ---------------------------------------------------------------- paper
-# LaTeX build artefacts
+# ---------------------------------------------------------------- LaTeX build artefacts
 *.aux
 *.bbl
 *.blg
@@ -86,27 +85,22 @@ slurm-*.out
 *.out
 *.synctex.gz
 *.toc
-paper/main.pdf
 
-# Regenerable bundles and page renders
-paper/acl/NEL_paper_overleaf.zip
-paper/_scratch/
-paper/pg-*.jpg
+# ---------------------------------------------------------------- local only
+# Figure output (rebuilt by scripts/figures/), paper and slide sources,
+# meeting decks and scratch output are kept on our machines, not in the repo.
+/figures/
+/paper/
+/presentation/
+/visualizations/
+/Claude outputs/
+/problem_formulation/
+/frederik_analysis_deck.*
+/grpo_pilot_bc5cdr.json
 slide-*.jpg
-
-# PNG previews - only the PDFs the paper actually loads are tracked
-figures/**/*.png
-paper/**/*.png
-
-# Superseded figures: figures/final/ is the paper's set, the rest are dead output
-figures/*.pdf
-figures/drafts/*.pdf
 
 # Reference papers (PDFs of other people's work; do not redistribute)
 refs/
-
-# Meeting decks: the .pptx source is tracked, the exported PDF is not
-frederik_analysis_deck.pdf
 
 # ---------------------------------------------------------------- misc
 # Environment variables / secrets

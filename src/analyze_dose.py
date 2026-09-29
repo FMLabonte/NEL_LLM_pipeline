@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Dose-response analysis for the graded retriever-degradation sweep.
 
-Reads the preds produced by bender_retriever_dose.sbatch and answers, on one
+Reads the preds produced by cluster/bender_retriever_dose.sbatch and answers, on one
 fixed candidate pool and one fixed mention set, the question the paper's frame
 currently answers only observationally: as the retriever's top-1 accuracy is
 lowered and nothing else changes, what happens to the LLM stage's gain, and to
 its effect on the mentions the retriever is confident about?
 
     python3 src/analyze_dose.py
-    python3 src/analyze_dose.py --figure figures/final/fig6_dose.pdf
+    python3 src/analyze_dose.py --figure figures/fig6_dose.pdf
 
 Prints a table and, with --figure, writes the dose-response plot.
 """
@@ -102,7 +102,7 @@ def main():
 
     if a.figure:
         import sys
-        sys.path.insert(0, str(ROOT / "figures" / "final"))
+        sys.path.insert(0, str(ROOT / "scripts" / "figures"))
         from aclfig import COL, DSCOL, INK, MUTED, NEG, use_acl, style
         import matplotlib.pyplot as plt
         use_acl()

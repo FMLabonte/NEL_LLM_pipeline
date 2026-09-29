@@ -31,8 +31,8 @@ INCLUDE = [
     "preds_dose_p*.jsonl",
     "mentions_bc5cdr_test.jsonl",
     "cands_biosyn_bc5cdr.jsonl",
-    "figures/final/*.py",
-    "figures/final/*.pdf",
+    "scripts/figures/*.py",
+    "figures/*.pdf",
     "src/finding1_analysis.py",
     "src/finding2_crosstab.py",
     "src/analyze_decomposition.py",
@@ -140,7 +140,7 @@ recomputed from the dumps.
     preds_*.jsonl              one row per mention (schema below)
     mentions_bc5cdr_test.jsonl the BC5CDR test mentions with gold concepts
     cands_biosyn_bc5cdr.jsonl  BioSyn's candidate lists for those mentions
-    figures/final/             the figure scripts and their PDF output
+    scripts/figures/           the figure scripts (output goes to figures/)
     src/                       the analysis scripts
     scripts/                   the retriever-degradation tool
 
@@ -169,7 +169,7 @@ as a "no second candidate" sentinel in that field.
 
 ## Reproducing
 
-    python3 figures/final/make_fig1_value.py        # and the other make_fig*.py
+    python3 scripts/figures/make_fig1_value.py        # and the other make_fig*.py
     python3 src/finding1_analysis.py preds_qwen3-4b-zeroshot_bc5cdr.jsonl --labels BC5CDR
     python3 src/analyze_dose.py
 

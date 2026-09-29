@@ -13,7 +13,7 @@ convention?" probe, then 4B, then larger. For 0.6B plain LoRA in bf16 is enough;
 for 4B+ add --load-in-4bit (QLoRA) to fit on one GPU.
 
 Version note: TRL's API moves fast. Written for the pinned versions in
-bender_finetune.sbatch (transformers>=4.46, trl>=0.12, peft>=0.13). If your TRL
+cluster/bender_finetune.sbatch (transformers>=4.46, trl>=0.12, peft>=0.13). If your TRL
 differs, the 3 lines flagged with [TRL] may need adjusting.
 
 Run (local smoke test):

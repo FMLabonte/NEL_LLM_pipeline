@@ -101,7 +101,7 @@ def main():
     print(f"\n{out}: {'vollstaendig' if ok else 'UNVOLLSTAENDIG'} -- {why}")
     if not ok:
         sys.exit("FEHLER: das Ergebnis ist unvollstaendig. 'quota -s' pruefen.")
-    print("fertig. Danach:  sbatch --array=<seed> bender_eval_ft_seeds.sbatch")
+    print("fertig. Danach:  sbatch --array=<seed> cluster/bender_eval_ft_seeds.sbatch")
 
 
 if __name__ == "__main__":

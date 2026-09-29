@@ -4,12 +4,12 @@
 Two checks, both run on prediction dumps only -- no model, no GPU.
 
   --models   Repeats the Finding-1 measurement for every extra disambiguator
-             produced by bender_multimodel.sbatch. The question is narrow: does
+             produced by cluster/bender_multimodel.sbatch. The question is narrow: does
              the mid-confidence band go net-harmful for this model too, on the
              corpora where it does for Qwen3-4B?
 
   --seeds    Reports the Finding-2 quantities for each LoRA seed produced by
-             bender_finetune_seeds.sbatch, as mean and range, so the paper can
+             cluster/bender_finetune_seeds.sbatch, as mean and range, so the paper can
              say how much of the effect is run-to-run noise.
 
     python3 src/analyze_robustness.py --models
@@ -378,7 +378,7 @@ def models_report(out):
                 "rate_over_error": cal[lab][0], "precision_over_error": cal[lab][1]}
     if not found:
         print("\n  Keine Modell-Laeufe gefunden. Erwartet z.B. preds_zs_bc5cdr_qwen3-8b.jsonl")
-        print("  (bender_multimodel.sbatch).")
+        print("  (cluster/bender_multimodel.sbatch).")
     else:
         print("\n  Lesart: das Vorzeichen der Spalte 'band [10,20)' ist die Aussage.")
         print("  Bleibt es ueber die Modelle hinweg negativ, ist die Danger Zone keine")
@@ -412,7 +412,7 @@ def seeds_report(out):
     fts = [(s, r) for s, r in fts if r]
     if not fts or not zs_bc5:
         print("\n  Keine Seed-Laeufe gefunden. Erwartet preds_ft_bc5cdr_s1.jsonl usw.")
-        print("  (bender_finetune_seeds.sbatch + bender_eval_ft_seeds.sbatch).")
+        print("  (cluster/bender_finetune_seeds.sbatch + cluster/bender_eval_ft_seeds.sbatch).")
         return
 
     # Der bisherige Einzellauf lief mit TRLs Default-Seed und ohne gesetztes
